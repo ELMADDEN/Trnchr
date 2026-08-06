@@ -137,7 +137,32 @@ async function getFlows(env) {
     `SELECT created_at, summary FROM verdicts ORDER BY id DESC LIMIT 1`
   ).first();
 
-  return { flows: flows.results || [], recent: recent.results || [], verdict };
+  // hourly net flow for the last 24h chart
+  const hourly = await env.DB.prepare(
+    `SELECT CAST(ts/3600 AS INTEGER) AS hr,
+            SUM(CASE WHEN side='BUY' THEN sol_amount ELSE -sol_amount END) AS net
+     FROM trades WHERE ts >= ?
+     GROUP BY hr ORDER BY hr`
+  ).bind(dayAgo).all();
+
+  const totals = flows.results
+    ? flows.results.reduce(
+        (a, f) => ({
+          net: a.net + (f.buy_sol - f.sell_sol),
+          whales: a.whales + f.whales,
+          trades: a.trades + f.trades,
+        }),
+        { net: 0, whales: 0, trades: 0 }
+      )
+    : { net: 0, whales: 0, trades: 0 };
+
+  return {
+    flows: flows.results || [],
+    recent: recent.results || [],
+    verdict,
+    hourly: hourly.results || [],
+    totals,
+  };
 }
 
 // ============================================================ ANALYST ======
@@ -206,89 +231,174 @@ async function dashboard(env) {
     );
   }
 
-  const { flows, recent, verdict } = data;
+  const { flows, recent, verdict, hourly, totals } = data;
+  const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
+
+  const lead = flows[0];
+  const leadNet = lead ? lead.buy_sol - lead.sell_sol : 0;
+
+  // build a continuous 24h cumulative-net series for the chart
+  const nowHr = Math.floor(Date.now() / 3600000);
+  const byHr = {};
+  hourly.forEach((h) => (byHr[h.hr] = h.net));
+  const labels = [];
+  const series = [];
+  let cum = 0;
+  for (let i = 23; i >= 0; i--) {
+    const hr = nowHr - i;
+    cum += byHr[hr] || 0;
+    const d = new Date(hr * 3600000);
+    labels.push(String(d.getUTCHours()).padStart(2, "0") + ":00");
+    series.push(Math.round(cum * 10) / 10);
+  }
 
   const flowRows = flows
     .map((f) => {
       const net = f.buy_sol - f.sell_sol;
-      const buyW = (f.buy_sol / maxFlow) * 100;
-      const sellW = (f.sell_sol / maxFlow) * 100;
-      return `<tr>
-        <td class="mint"><a href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">${short(f.mint)}</a></td>
-        <td class="bars">
-          <div class="axis">
-            <div class="sell" style="width:${sellW / 2}%"></div>
-            <div class="buy"  style="width:${buyW / 2}%"></div>
-          </div>
-        </td>
-        <td class="num ${net >= 0 ? "pos" : "neg"}">${net >= 0 ? "+" : ""}${net.toFixed(1)}</td>
-        <td class="num">${f.buy_sol.toFixed(1)}</td>
-        <td class="num">${f.sell_sol.toFixed(1)}</td>
-        <td class="num">${f.trades}</td>
-        <td class="num">${f.whales}</td>
-      </tr>`;
+      const pos = net >= 0;
+      const buyW = (f.buy_sol / maxFlow) * 50;
+      const sellW = (f.sell_sol / maxFlow) * 50;
+      return `<div class="frow">
+        <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">$${short(f.mint)}</a>
+        <span class="axis">
+          <span class="lft"><span class="sell" style="width:${sellW}%"></span></span>
+          <span class="cen"></span>
+          <span class="rgt"><span class="buy" style="width:${buyW}%"></span></span>
+        </span>
+        <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)} SOL</span>
+      </div>`;
     })
     .join("");
 
   const recentRows = recent
-    .map(
-      (r) => `<tr>
-        <td class="num">${new Date(r.ts * 1000).toISOString().slice(5, 16).replace("T", " ")}</td>
-        <td class="${r.side === "BUY" ? "pos" : "neg"}">${r.side}</td>
-        <td class="num">${r.sol_amount.toFixed(1)}</td>
-        <td class="mint">${short(r.mint)}</td>
-        <td class="mint"><a href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}</a></td>
-      </tr>`
-    )
+    .map((r, i) => {
+      const c = r.side === "BUY" ? "pos" : "neg";
+      const t = new Date(r.ts * 1000);
+      const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
+      return `<div class="trow"${i === 0 ? ' style="border-top:none"' : ""}>
+        <span class="tm">${hm}</span>
+        <span class="side ${c}">${r.side}</span>
+        <span class="tsol">${r.sol_amount.toFixed(1)} SOL</span>
+        <span class="tsym">$${short(r.mint)}</span>
+        <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}</a>
+      </div>`;
+    })
     .join("");
 
   const html = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Whale Radar</title>
+<title>Trnchr — whale flow field report</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#071119;--panel:#0D1E2C;--line:#16344A;--txt:#E4ECF2;--mut:#7C93A6;
-        --buy:#3FD0C0;--sell:#F0705E;--sand:#D8C08F;}
+  :root{--paper:#F3EFE6;--ink:#2B2A26;--mut:#8A8577;--line:#C9C3B3;--faint:#DCD6C8;
+        --buy:#1D7A63;--sell:#B0432A;--card:#FBF9F3;}
   *{box-sizing:border-box;margin:0}
-  body{background:var(--bg);color:var(--txt);
-       font:15px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;padding:28px 4vw}
-  h1{font-size:17px;letter-spacing:.25em;color:var(--sand);font-weight:600}
-  h1 .dot{color:var(--buy)}
-  .sub{color:var(--mut);font-size:12px;margin:4px 0 26px}
-  section{background:var(--panel);border:1px solid var(--line);border-radius:6px;
-          padding:18px 20px;margin-bottom:22px}
-  h2{font-size:11px;letter-spacing:.2em;color:var(--mut);font-weight:600;margin-bottom:12px}
-  table{width:100%;border-collapse:collapse;font-size:13px}
-  th{color:var(--mut);font-weight:500;text-align:right;padding:4px 8px;font-size:11px;letter-spacing:.08em}
-  th:first-child,td.mint{text-align:left}
-  td{padding:6px 8px;border-top:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}
-  td.mint a{color:var(--txt);text-decoration:none;border-bottom:1px dotted var(--mut)}
-  .pos{color:var(--buy)} .neg{color:var(--sell)}
-  .bars{width:34%} .axis{display:flex;justify-content:center;height:10px;position:relative}
-  .axis::before{content:"";position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;background:var(--line)}
-  .buy{background:var(--buy);height:100%;border-radius:0 3px 3px 0}
-  .sell{background:var(--sell);height:100%;border-radius:3px 0 0 3px;margin-left:auto}
-  .axis{gap:0}.sell{order:1}.buy{order:2}
-  pre{white-space:pre-wrap;color:var(--txt);font-size:13px}
-  .empty{color:var(--mut);padding:14px 0}
+  body{background:var(--paper);color:var(--ink);
+       font:14px/1.5 "JetBrains Mono",ui-monospace,Menlo,monospace;
+       padding:26px 5vw;max-width:920px;margin:0 auto}
+  .serif{font-family:"Newsreader",Georgia,serif}
+  .head{display:flex;align-items:flex-end;justify-content:space-between;
+        border-bottom:2px solid var(--ink);padding-bottom:10px}
+  .rule{height:4px;border-bottom:.5px solid var(--line);margin-bottom:20px}
+  .brand{font-size:30px;font-weight:500;letter-spacing:.02em;line-height:1}
+  .tag{font-size:10px;color:var(--mut);letter-spacing:.18em;margin-top:5px}
+  .meta{text-align:right;font-size:10px;color:var(--mut);letter-spacing:.12em}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--buy);margin-top:4px}
+  .live b{width:6px;height:6px;border-radius:50%;background:var(--buy);display:inline-block}
+  .kpis{display:grid;grid-template-columns:1.1fr 1fr 1fr;margin-bottom:24px}
+  .kpi{padding:0 18px;border-right:.5px solid var(--line)}
+  .kpi:first-child{padding-left:0}.kpi:last-child{border-right:none;padding-right:0}
+  .klab{font-size:10px;color:var(--mut);letter-spacing:.1em;margin-bottom:4px}
+  .kbig{font-size:40px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums}
+  .ksub{font-size:11px;color:var(--mut);margin-top:2px}
+  .sec{font-size:10px;color:var(--mut);letter-spacing:.12em;margin-bottom:10px}
+  .chartwrap{position:relative;width:100%;height:150px;margin-bottom:24px}
+  .frow{display:grid;grid-template-columns:78px 1fr 86px;align-items:center;gap:12px;
+        padding:8px 0;border-top:.5px solid var(--line)}
+  .sym{font-weight:500;color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--mut)}
+  .axis{display:flex;align-items:center;height:15px}
+  .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
+  .cen{width:1px;height:17px;background:var(--ink)}
+  .sell{height:13px;background:var(--sell)}.buy{display:block;height:13px;background:var(--buy)}
+  .net{text-align:right;font-variant-numeric:tabular-nums}
+  .pos{color:var(--buy)}.neg{color:var(--sell)}
+  .dispatch{border-top:2px solid var(--ink);padding-top:12px;margin-bottom:24px}
+  .dtxt{font-size:15px;line-height:1.55}
+  .trow{display:grid;grid-template-columns:52px 44px 76px 1fr 92px;align-items:center;gap:8px;
+        padding:7px 0;border-top:.5px solid var(--line);font-size:13px}
+  .tm{color:var(--mut);font-variant-numeric:tabular-nums}
+  .side{font-weight:500}.tsol{text-align:right;font-variant-numeric:tabular-nums}
+  .tsym{color:var(--mut);padding-left:6px}
+  .tw{text-align:right;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--line)}
+  .empty{color:var(--mut);padding:14px 0;font-size:13px}
+  a{color:inherit}
 </style></head><body>
-<h1>WHALE RADAR <span class="dot">●</span></h1>
-<div class="sub">accumulated whale flows · last 24h · trades ≥ ${env.MIN_TRADE_SOL || 25} SOL · auto-refresh 60s</div>
 
-<section><h2>NET FLOW BY TOKEN (SOL)</h2>
-${flows.length ? `<table><tr><th>TOKEN</th><th>SELL ◂ ▸ BUY</th><th>NET</th><th>BUYS</th><th>SELLS</th><th>TRADES</th><th>WHALES</th></tr>${flowRows}</table>`
-               : `<div class="empty">No whale trades recorded yet. Once your Helius webhook fires, flows appear here.</div>`}
-</section>
+<div class="head">
+  <div>
+    <div class="brand serif">Trnchr</div>
+    <div class="tag">WHALE FLOW · FIELD REPORT</div>
+  </div>
+  <div>
+    <div class="meta">24H WINDOW · ≥${minSol} SOL</div>
+    <div class="live"><b></b>COLLECTING</div>
+  </div>
+</div>
+<div class="rule"></div>
 
-<section><h2>ANALYST — LATEST VERDICT (EVERY 6H)</h2>
-${verdict ? `<pre>${escapeHtml(verdict.summary)}</pre>` : `<div class="empty">First verdict lands after the next 6-hour cron run.</div>`}
-</section>
+<div class="kpis">
+  <div class="kpi">
+    <div class="klab">NET FLOW · ALL TOKENS</div>
+    <div class="kbig serif ${totals.net >= 0 ? "pos" : "neg"}">${totals.net >= 0 ? "+" : ""}${Math.round(totals.net)}</div>
+    <div class="ksub">SOL ${totals.net >= 0 ? "accumulated" : "distributed"}</div>
+  </div>
+  <div class="kpi">
+    <div class="klab">UNIQUE WHALES</div>
+    <div class="kbig serif">${totals.whales}</div>
+    <div class="ksub">${totals.trades} trades</div>
+  </div>
+  <div class="kpi">
+    <div class="klab">LEAD SIGNAL</div>
+    ${lead
+      ? `<div class="kbig serif ${leadNet >= 0 ? "pos" : "neg"}" style="font-size:20px;margin-top:6px">$${short(lead.mint)}</div>
+         <div class="ksub">${leadNet >= 0 ? "accumulating" : "distributing"} · ${lead.whales} whales</div>`
+      : `<div class="ksub" style="margin-top:8px">awaiting data</div>`}
+  </div>
+</div>
 
-<section><h2>RECENT WHALE TRADES</h2>
-${recent.length ? `<table><tr><th>UTC</th><th>SIDE</th><th>SOL</th><th>TOKEN</th><th>WALLET</th></tr>${recentRows}</table>`
-                : `<div class="empty">Nothing yet.</div>`}
-</section>
-<script>setTimeout(()=>location.reload(),60000)</script>
+<div class="sec">NET FLOW · 24H (SOL)</div>
+<div class="chartwrap">
+  <canvas id="flowChart" role="img" aria-label="Cumulative net whale flow over the last 24 hours in SOL"></canvas>
+</div>
+
+<div class="sec">BY TOKEN &nbsp;·&nbsp; <span style="color:var(--sell)">sell ◂</span> &nbsp; <span style="color:var(--buy)">▸ buy</span></div>
+${flows.length ? flowRows : `<div class="empty">No whale trades recorded yet. Once your Helius webhook fires, flows appear here.</div>`}
+<div style="height:24px"></div>
+
+<div class="dispatch">
+  <div class="sec">ANALYST DISPATCH · every 6h</div>
+  ${verdict ? `<div class="dtxt serif">${escapeHtml(verdict.summary)}</div>` : `<div class="empty">First dispatch lands after the next 6-hour run (00/06/12/18 UTC).</div>`}
+</div>
+
+<div class="sec">RECENT WHALE TRADES</div>
+${recent.length ? recentRows : `<div class="empty">Nothing yet.</div>`}
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+  var L=${JSON.stringify(labels)}, D=${JSON.stringify(series)};
+  new Chart(document.getElementById('flowChart'),{
+    type:'line',
+    data:{labels:L,datasets:[{data:D,borderColor:'#1D7A63',borderWidth:2,fill:true,
+      backgroundColor:'rgba(29,122,99,0.10)',pointRadius:0,tension:0.35}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.parsed.y+' SOL net';}}}},
+      scales:{x:{grid:{display:false},ticks:{color:'#8A8577',font:{size:10,family:'monospace'},maxTicksLimit:6}},
+              y:{grid:{color:'#DCD6C8'},border:{display:false},ticks:{color:'#8A8577',font:{size:10,family:'monospace'}}}}}
+  });
+  setTimeout(function(){location.reload();},60000);
+</script>
 </body></html>`;
 
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
