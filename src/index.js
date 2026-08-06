@@ -457,7 +457,14 @@ async function dashboard(env, window) {
   const { flows, recent, verdict, buckets, bucketSeconds, totals } = data;
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
-  const market = await getMarketData(env, flows.map((f) => f.mint));
+  let market = {};
+  try {
+    market = await getMarketData(env, flows.map((f) => f.mint));
+  } catch (e) {
+    // market_cache may not exist yet on an un-migrated database — market
+    // data is best-effort, so degrade to "no stats" instead of a 500.
+    console.log("market data error", e.message);
+  }
   const dexVolField = window === "1h" ? "volume_1h" : window === "6h" ? "volume_6h" : "volume_24h";
 
   const netPos = totals.net >= 0;
