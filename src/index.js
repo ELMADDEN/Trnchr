@@ -235,50 +235,49 @@ async function dashboard(env) {
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
 
-  const lead = flows[0];
-  const leadNet = lead ? lead.buy_sol - lead.sell_sol : 0;
+  const netPos = totals.net >= 0;
+  const heroColor = netPos ? "#12b886" : "#ff5a4d";
 
-  // build a continuous 24h cumulative-net series for the chart
+  let buySol = 0, sellSol = 0;
+  flows.forEach((f) => { buySol += f.buy_sol; sellSol += f.sell_sol; });
+
+  // 24h cumulative-net series for the dot pulse
   const nowHr = Math.floor(Date.now() / 3600000);
   const byHr = {};
   hourly.forEach((h) => (byHr[h.hr] = h.net));
-  const labels = [];
   const series = [];
   let cum = 0;
   for (let i = 23; i >= 0; i--) {
-    const hr = nowHr - i;
-    cum += byHr[hr] || 0;
-    const d = new Date(hr * 3600000);
-    labels.push(String(d.getUTCHours()).padStart(2, "0") + ":00");
+    cum += byHr[nowHr - i] || 0;
     series.push(Math.round(cum * 10) / 10);
   }
 
   const flowRows = flows
-    .map((f) => {
+    .map((f, i) => {
       const net = f.buy_sol - f.sell_sol;
       const pos = net >= 0;
-      const buyW = (f.buy_sol / maxFlow) * 50;
-      const sellW = (f.sell_sol / maxFlow) * 50;
-      return `<div class="frow">
+      const sw = (f.sell_sol / maxFlow) * 50;
+      const bw = (f.buy_sol / maxFlow) * 50;
+      return `<div class="frow"${i === 0 ? ' style="border-top:none"' : ""}>
         <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">$${short(f.mint)}</a>
         <span class="axis">
-          <span class="lft"><span class="sell" style="width:${sellW}%"></span></span>
+          <span class="lft"><span class="sell" style="width:${sw}%"></span></span>
           <span class="cen"></span>
-          <span class="rgt"><span class="buy" style="width:${buyW}%"></span></span>
+          <span class="rgt"><span class="buy" style="width:${bw}%"></span></span>
         </span>
-        <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)} SOL</span>
+        <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)}</span>
       </div>`;
     })
     .join("");
 
   const recentRows = recent
     .map((r, i) => {
-      const c = r.side === "BUY" ? "pos" : "neg";
+      const isBuy = r.side === "BUY";
       const t = new Date(r.ts * 1000);
       const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
       return `<div class="trow"${i === 0 ? ' style="border-top:none"' : ""}>
         <span class="tm">${hm}</span>
-        <span class="side ${c}">${r.side}</span>
+        <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
         <span class="tsol">${r.sol_amount.toFixed(1)} SOL</span>
         <span class="tsym">$${short(r.mint)}</span>
         <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}</a>
@@ -288,116 +287,106 @@ async function dashboard(env) {
 
   const html = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trnchr — whale flow field report</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<title>Trnchr — whale flow</title>
 <style>
-  :root{--paper:#F3EFE6;--ink:#2B2A26;--mut:#8A8577;--line:#C9C3B3;--faint:#DCD6C8;
-        --buy:#1D7A63;--sell:#B0432A;--card:#FBF9F3;}
+  :root{--teal:#12b886;--coral:#ff5a4d;--ink:#0b0b0d;--mut:#8a8a90;--mut2:#b0b0b6;
+        --line:#eeeeef;--card:#fff;--page:#e8e8ea;}
   *{box-sizing:border-box;margin:0}
-  body{background:var(--paper);color:var(--ink);
-       font:14px/1.5 "JetBrains Mono",ui-monospace,Menlo,monospace;
-       padding:26px 5vw;max-width:920px;margin:0 auto}
-  .serif{font-family:"Newsreader",Georgia,serif}
-  .head{display:flex;align-items:flex-end;justify-content:space-between;
-        border-bottom:2px solid var(--ink);padding-bottom:10px}
-  .rule{height:4px;border-bottom:.5px solid var(--line);margin-bottom:20px}
-  .brand{font-size:30px;font-weight:500;letter-spacing:.02em;line-height:1}
-  .tag{font-size:10px;color:var(--mut);letter-spacing:.18em;margin-top:5px}
-  .meta{text-align:right;font-size:10px;color:var(--mut);letter-spacing:.12em}
-  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--buy);margin-top:4px}
-  .live b{width:6px;height:6px;border-radius:50%;background:var(--buy);display:inline-block}
-  .kpis{display:grid;grid-template-columns:1.1fr 1fr 1fr;margin-bottom:24px}
-  .kpi{padding:0 18px;border-right:.5px solid var(--line)}
-  .kpi:first-child{padding-left:0}.kpi:last-child{border-right:none;padding-right:0}
-  .klab{font-size:10px;color:var(--mut);letter-spacing:.1em;margin-bottom:4px}
-  .kbig{font-size:40px;font-weight:500;line-height:1;font-variant-numeric:tabular-nums}
-  .ksub{font-size:11px;color:var(--mut);margin-top:2px}
-  .sec{font-size:10px;color:var(--mut);letter-spacing:.12em;margin-bottom:10px}
-  .chartwrap{position:relative;width:100%;height:150px;margin-bottom:24px}
-  .frow{display:grid;grid-template-columns:78px 1fr 86px;align-items:center;gap:12px;
-        padding:8px 0;border-top:.5px solid var(--line)}
-  .sym{font-weight:500;color:var(--ink);text-decoration:none;border-bottom:1px dotted var(--mut)}
-  .axis{display:flex;align-items:center;height:15px}
+  body{background:var(--page);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
+       color:var(--ink);padding:16px;max-width:760px;margin:0 auto}
+  .hero{background:var(--ink);border-radius:18px;padding:22px 22px 6px;margin-bottom:12px;overflow:hidden}
+  .htop{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .brand{font-size:18px;font-weight:600;letter-spacing:-0.01em;color:#fff}
+  .htag{font-size:11px;color:#6b6b70;margin-left:9px}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal)}
+  .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block}
+  .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
+  .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
+  .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
+  .pulsewrap{position:relative;height:80px;margin:6px -6px -2px}
+  .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
+  .card{background:var(--card);border-radius:14px;padding:14px 16px}
+  .clab{font-size:11px;color:var(--mut);margin-bottom:8px}
+  .cnum{font-size:26px;font-weight:600;letter-spacing:-0.02em}
+  .csub{font-size:11px;color:var(--mut);margin-top:2px}
+  .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
+  .frow{display:grid;grid-template-columns:110px 1fr 74px;align-items:center;gap:12px;padding:9px 0;border-top:0.5px solid var(--line)}
+  .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none}
+  .axis{display:flex;align-items:center;height:14px}
   .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
-  .cen{width:1px;height:17px;background:var(--ink)}
-  .sell{height:13px;background:var(--sell)}.buy{display:block;height:13px;background:var(--buy)}
-  .net{text-align:right;font-variant-numeric:tabular-nums}
-  .pos{color:var(--buy)}.neg{color:var(--sell)}
-  .dispatch{border-top:2px solid var(--ink);padding-top:12px;margin-bottom:24px}
-  .dtxt{font-size:15px;line-height:1.55}
-  .trow{display:grid;grid-template-columns:52px 44px 76px 1fr 92px;align-items:center;gap:8px;
-        padding:7px 0;border-top:.5px solid var(--line);font-size:13px}
+  .cen{width:1px;height:16px;background:#e0e0e4}
+  .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
+  .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
+  .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+  .pos{color:var(--teal)}.neg{color:var(--coral)}
+  .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
+  .trow{display:grid;grid-template-columns:46px 42px 74px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
   .tm{color:var(--mut);font-variant-numeric:tabular-nums}
-  .side{font-weight:500}.tsol{text-align:right;font-variant-numeric:tabular-nums}
-  .tsym{color:var(--mut);padding-left:6px}
-  .tw{text-align:right;color:var(--mut);text-decoration:none;border-bottom:1px dotted var(--line)}
-  .empty{color:var(--mut);padding:14px 0;font-size:13px}
-  a{color:inherit}
+  .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+  .tsym{color:var(--mut);padding-left:8px}
+  .tw{text-align:right;color:var(--mut2);text-decoration:none}
+  .empty{color:var(--mut);padding:10px 0;font-size:13px}
 </style></head><body>
 
-<div class="head">
-  <div>
-    <div class="brand serif">Trnchr</div>
-    <div class="tag">WHALE FLOW · FIELD REPORT</div>
+<div class="hero">
+  <div class="htop">
+    <div><span class="brand">Trnchr</span><span class="htag">whale flow</span></div>
+    <span class="live"><b></b>Collecting</span>
   </div>
-  <div>
-    <div class="meta">24H WINDOW · ≥${minSol} SOL</div>
-    <div class="live"><b></b>COLLECTING</div>
+  <div class="hlab">Net flow · 24h · all tokens · ≥${minSol} SOL</div>
+  <div style="display:flex;align-items:baseline">
+    <span class="hero-num" style="color:${heroColor}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
+    <span class="hsub">SOL ${netPos ? "accumulated" : "distributed"}</span>
   </div>
-</div>
-<div class="rule"></div>
-
-<div class="kpis">
-  <div class="kpi">
-    <div class="klab">NET FLOW · ALL TOKENS</div>
-    <div class="kbig serif ${totals.net >= 0 ? "pos" : "neg"}">${totals.net >= 0 ? "+" : ""}${Math.round(totals.net)}</div>
-    <div class="ksub">SOL ${totals.net >= 0 ? "accumulated" : "distributed"}</div>
-  </div>
-  <div class="kpi">
-    <div class="klab">UNIQUE WHALES</div>
-    <div class="kbig serif">${totals.whales}</div>
-    <div class="ksub">${totals.trades} trades</div>
-  </div>
-  <div class="kpi">
-    <div class="klab">LEAD SIGNAL</div>
-    ${lead
-      ? `<div class="kbig serif ${leadNet >= 0 ? "pos" : "neg"}" style="font-size:20px;margin-top:6px">$${short(lead.mint)}</div>
-         <div class="ksub">${leadNet >= 0 ? "accumulating" : "distributing"} · ${lead.whales} whales</div>`
-      : `<div class="ksub" style="margin-top:8px">awaiting data</div>`}
-  </div>
+  <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="24h cumulative net whale flow"></canvas></div>
 </div>
 
-<div class="sec">NET FLOW · 24H (SOL)</div>
-<div class="chartwrap">
-  <canvas id="flowChart" role="img" aria-label="Cumulative net whale flow over the last 24 hours in SOL"></canvas>
+<div class="cards">
+  <div class="card"><div class="clab">Whales</div><div class="cnum">${totals.whales}</div><div class="csub">${totals.trades} trades</div></div>
+  <div class="card"><div class="clab">Buys</div><div class="cnum pos">${flows.filter(f=>f.buy_sol>0).length}</div><div class="csub">${Math.round(buySol)} SOL in</div></div>
+  <div class="card"><div class="clab">Sells</div><div class="cnum neg">${flows.filter(f=>f.sell_sol>0).length}</div><div class="csub">${Math.round(sellSol)} SOL out</div></div>
 </div>
 
-<div class="sec">BY TOKEN &nbsp;·&nbsp; <span style="color:var(--sell)">sell ◂</span> &nbsp; <span style="color:var(--buy)">▸ buy</span></div>
-${flows.length ? flowRows : `<div class="empty">No whale trades recorded yet. Once your Helius webhook fires, flows appear here.</div>`}
-<div style="height:24px"></div>
-
-<div class="dispatch">
-  <div class="sec">ANALYST DISPATCH · every 6h</div>
-  ${verdict ? `<div class="dtxt serif">${escapeHtml(verdict.summary)}</div>` : `<div class="empty">First dispatch lands after the next 6-hour run (00/06/12/18 UTC).</div>`}
+<div class="panel">
+  <div class="phead"><span>By token</span><span style="color:#c4c4ca">sell ◂ ▸ buy</span></div>
+  ${flows.length ? flowRows : `<div class="empty">No whale trades yet. Once Helius fires, flows appear here.</div>`}
 </div>
 
-<div class="sec">RECENT WHALE TRADES</div>
-${recent.length ? recentRows : `<div class="empty">Nothing yet.</div>`}
+<div class="disp">
+  <div class="phead"><span>Analyst dispatch · every 6h</span></div>
+  ${verdict ? `<div class="dtxt">${escapeHtml(verdict.summary)}</div>` : `<div class="empty">First dispatch after the next 6-hour run (00/06/12/18 UTC).</div>`}
+</div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<div class="panel">
+  <div class="phead"><span>Recent whale trades</span></div>
+  ${recent.length ? recentRows : `<div class="empty">Nothing yet.</div>`}
+</div>
+
 <script>
-  var L=${JSON.stringify(labels)}, D=${JSON.stringify(series)};
-  new Chart(document.getElementById('flowChart'),{
-    type:'line',
-    data:{labels:L,datasets:[{data:D,borderColor:'#1D7A63',borderWidth:2,fill:true,
-      backgroundColor:'rgba(29,122,99,0.10)',pointRadius:0,tension:0.35}]},
-    options:{responsive:true,maintainAspectRatio:false,
-      plugins:{legend:{display:false},tooltip:{callbacks:{label:function(c){return c.parsed.y+' SOL net';}}}},
-      scales:{x:{grid:{display:false},ticks:{color:'#8A8577',font:{size:10,family:'monospace'},maxTicksLimit:6}},
-              y:{grid:{color:'#DCD6C8'},border:{display:false},ticks:{color:'#8A8577',font:{size:10,family:'monospace'}}}}}
-  });
-  setTimeout(function(){location.reload();},60000);
+(function(){
+  var S=${JSON.stringify(series)}, COL="${heroColor}";
+  function rgba(a){var h=COL.substring(1);var r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);return "rgba("+r+","+g+","+b+","+a+")";}
+  var cv=document.getElementById('pulse');
+  var dpr=Math.min(window.devicePixelRatio||1,2), W=cv.clientWidth||700, H=80;
+  cv.width=W*dpr; cv.height=H*dpr; var ctx=cv.getContext('2d'); ctx.scale(dpr,dpr);
+  var n=S.length, lo=Math.min(0,Math.min.apply(null,S)), hi=Math.max(0,Math.max.apply(null,S));
+  var span=(hi-lo)||1, gap=6, dot=1.6, base=(hi/span)*(H-16)+8;
+  for(var x=0;x<W;x+=gap){
+    var fi=(x/W)*(n-1), i0=Math.floor(fi), i1=Math.min(i0+1,n-1), f=fi-i0;
+    var v=S[i0]+(S[i1]-S[i0])*f;
+    var yv=((hi-v)/span)*(H-16)+8;
+    var y0=Math.min(base,yv), y1=Math.max(base,yv);
+    for(var y=y1;y>=y0;y-=gap){
+      var head=Math.abs(y-(v<0?y1:y0))<gap;
+      ctx.fillStyle=head?COL:(x>W*0.7?rgba(0.5):rgba(0.22));
+      ctx.beginPath(); ctx.arc(x,y,head?dot+0.6:dot,0,7); ctx.fill();
+    }
+  }
+})();
+setTimeout(function(){location.reload();},60000);
 </script>
 </body></html>`;
 
