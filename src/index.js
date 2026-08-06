@@ -3,22 +3,37 @@
  *
  * What it does:
  *   1. Receives swap events from Helius webhooks  (POST /webhook?key=...)
- *   2. Keeps only trades >= MIN_TRADE_SOL and stores them in D1
+ *   2. Stores every trade >= DUST_FLOOR_SOL in D1 (a low per-trade floor —
+ *      NOT the whale threshold; see below)
  *   3. Shows accumulated whale flows at your worker URL  (GET /)
  *   4. Every 6 hours, an "analyst" cron summarises the last 24h
  *      (uses the Claude API if ANTHROPIC_API_KEY is set, otherwise
  *       writes a plain computed summary)
  *
+ * "Whale" is a CUMULATIVE, QUERY-TIME concept, not a per-trade filter:
+ * an "actor" (a wallet, or a cluster of wallets sharing a funder — see
+ * wallet_funding below) qualifies as a whale for a token if its total
+ * volume within the selected time window is >= MIN_TRADE_SOL. This is
+ * deliberate: filtering single trades by size at ingestion is trivially
+ * bypassed by splitting one big buy into many small ones. Storing
+ * everything above a low dust floor and aggregating per actor at query
+ * time catches that split-transaction pattern.
+ *
  * Settings (set in Cloudflare dashboard -> your worker -> Settings -> Variables):
  *   WEBHOOK_SECRET      required — any password you invent; must match the ?key= in your Helius webhook URL
- *   MIN_TRADE_SOL       optional — minimum trade size in SOL to record (default 25)
+ *   MIN_TRADE_SOL       optional — cumulative SOL an actor must move (buys+sells) within the selected window to count as a whale (default 25)
+ *   DUST_FLOOR_SOL      optional — minimum SINGLE trade size to even bother storing (default 1); lower = catches finer-grained splitting, costs more D1 writes
  *   ANTHROPIC_API_KEY   optional — enables the AI analyst
+ *   HELIUS_API_KEY       optional — enables wallet-funding lookups, which cluster whale activity split across multiple wallets funded by the same source
  *
  * USD pricing and token symbols come from Jupiter's free public API
  * (lite-api.jup.ag — no key or signup needed). Live market stats (price
  * change, market cap, liquidity, volume) come from DexScreener's free
- * public API. All three are best-effort: if a lookup fails, the affected
- * figures are just left blank instead of breaking the page.
+ * public API. Wallet-funding lookups come from Helius's Enhanced
+ * Transactions API (needs HELIUS_API_KEY, a different credential than
+ * your webhook secret — same free Helius account). All of these are
+ * best-effort: if a lookup fails, the affected figures are just left
+ * blank instead of breaking the page.
  *
  * The dashboard supports a ?window= query param (1h, 6h, 24h, 7d) that
  * controls every stat on the page, e.g. /?window=6h.
@@ -28,8 +43,11 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3";
 const JUPITER_TOKEN_URL = "https://lite-api.jup.ag/tokens/v2/search";
 const DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana";
-const TOKEN_META_TTL = 7 * 86400;   // refresh cached symbols weekly
-const MARKET_CACHE_TTL = 90;        // refresh cached market stats every 90s
+const HELIUS_API_URL = "https://api.helius.xyz/v0/addresses";
+const TOKEN_META_TTL = 7 * 86400;      // refresh cached symbols weekly
+const MARKET_CACHE_TTL = 90;           // refresh cached market stats every 90s
+const FUNDING_CACHE_TTL = 14 * 86400;  // recheck a wallet's funding source every 2 weeks
+const MIN_TRANSFER_LAMPORTS = 0.05 * 1e9; // ignore dust/fee-relay transfers when looking for a funder
 
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
@@ -77,25 +95,30 @@ async function handleWebhook(request, url, env) {
   }
 
   const txs = Array.isArray(payload) ? payload : [payload];
-  const minSol = parseFloat(env.MIN_TRADE_SOL || "25");
+  const dustFloor = parseFloat(env.DUST_FLOOR_SOL || "1");
   const now = Math.floor(Date.now() / 1000);
 
-  const whales = [];
+  // Store every trade above the dust floor — NOT just ones that individually
+  // clear the whale threshold. Whale status is computed at query time from
+  // cumulative actor volume (see getFlows), so a single-trade size filter
+  // here would just let split-transaction accumulation bypass detection.
+  const candidates = [];
   for (const tx of txs) {
     const t = parseSwap(tx);
-    if (!t) continue;                 // not a swap we understand
-    if (t.sol_amount < minSol) continue; // too small — not a whale
-    whales.push(t);
+    if (!t) continue;                    // not a swap we understand
+    if (t.sol_amount < dustFloor) continue; // too small to matter even split up
+    candidates.push(t);
   }
 
   let stored = 0;
-  if (whales.length) {
+  if (candidates.length) {
     const [solPrice] = await Promise.all([
       getSolPriceUsd(),
-      resolveTokenMeta(env, whales.map((t) => t.mint)), // warms token_meta for the dashboard
+      resolveTokenMeta(env, candidates.map((t) => t.mint)),   // warms token_meta for the dashboard
+      resolveFundingSource(env, candidates.map((t) => t.wallet)), // warms wallet_funding for clustering
     ]);
 
-    for (const t of whales) {
+    for (const t of candidates) {
       const usdAmount = solPrice != null ? t.sol_amount * solPrice : null;
       try {
         await env.DB.prepare(
@@ -143,11 +166,17 @@ async function resolveTokenMeta(env, mints) {
 
   const now = Math.floor(Date.now() / 1000);
   const placeholders = unique.map(() => "?").join(",");
-  const cached = await env.DB.prepare(
-    `SELECT mint, symbol, name, updated_at FROM token_meta WHERE mint IN (${placeholders})`
-  )
-    .bind(...unique)
-    .all();
+  let cached;
+  try {
+    cached = await env.DB.prepare(
+      `SELECT mint, symbol, name, updated_at FROM token_meta WHERE mint IN (${placeholders})`
+    )
+      .bind(...unique)
+      .all();
+  } catch (e) {
+    console.log("token_meta read error", e.message); // e.g. migration not run yet — never let this block ingestion
+    return {};
+  }
 
   const cachedByMint = {};
   (cached.results || []).forEach((r) => (cachedByMint[r.mint] = r));
@@ -194,6 +223,74 @@ async function resolveTokenMeta(env, mints) {
   }
 
   return meta;
+}
+
+/**
+ * Best-effort: for each wallet, find the most recent external SOL transfer
+ * INTO it (a heuristic "funder"), via Helius's Enhanced Transactions API,
+ * and cache it in wallet_funding. Used to cluster whale activity that's
+ * been split across several wallets funded from the same source.
+ *
+ * This is a heuristic, not a full recursive funding graph: it only looks
+ * at each wallet's most recent handful of transfers, and it will pick up
+ * a DEX/router address as the "funder" if that's genuinely the most recent
+ * SOL inflow (e.g. proceeds from a prior sell). Good enough to catch naive
+ * sybil-wallet structuring; not a substitute for real chain-forensics
+ * tooling. No-ops entirely if HELIUS_API_KEY isn't set.
+ */
+async function resolveFundingSource(env, wallets) {
+  if (!env.HELIUS_API_KEY) return;
+  const unique = [...new Set(wallets)];
+  if (!unique.length) return;
+
+  const now = Math.floor(Date.now() / 1000);
+  const placeholders = unique.map(() => "?").join(",");
+  let cached;
+  try {
+    cached = await env.DB.prepare(
+      `SELECT wallet, checked_at FROM wallet_funding WHERE wallet IN (${placeholders})`
+    )
+      .bind(...unique)
+      .all();
+  } catch (e) {
+    console.log("wallet_funding read error (migration not run yet?)", e.message);
+    return; // never let this block trade ingestion
+  }
+
+  const checkedByWallet = {};
+  (cached.results || []).forEach((r) => (checkedByWallet[r.wallet] = r.checked_at));
+  const stale = unique.filter((w) => now - (checkedByWallet[w] || 0) >= FUNDING_CACHE_TTL);
+
+  for (const wallet of stale) {
+    try {
+      const res = await fetch(
+        `${HELIUS_API_URL}/${wallet}/transactions?api-key=${env.HELIUS_API_KEY}&type=TRANSFER&limit=20`,
+        { signal: AbortSignal.timeout(4000) }
+      );
+      if (!res.ok) continue;
+      const txs = await res.json();
+
+      let fundedBy = null;
+      for (const tx of Array.isArray(txs) ? txs : []) {
+        for (const nt of tx.nativeTransfers || []) {
+          if (nt.toUserAccount === wallet && nt.fromUserAccount !== wallet && nt.amount >= MIN_TRANSFER_LAMPORTS) {
+            fundedBy = nt.fromUserAccount;
+            break;
+          }
+        }
+        if (fundedBy) break;
+      }
+
+      await env.DB.prepare(
+        `INSERT INTO wallet_funding (wallet, funded_by, checked_at) VALUES (?, ?, ?)
+         ON CONFLICT(wallet) DO UPDATE SET funded_by=excluded.funded_by, checked_at=excluded.checked_at`
+      )
+        .bind(wallet, fundedBy, now)
+        .run();
+    } catch (e) {
+      console.log("helius funding lookup error", e.message);
+    }
+  }
 }
 
 /**
@@ -323,31 +420,101 @@ function parseSwap(tx) {
 
 // ============================================================ QUERIES ======
 
+/**
+ * Shared CTE: maps every wallet active in the window to an "actor" and
+ * qualifies actors whose cumulative volume clears MIN_TRADE_SOL as
+ * whale_actors. Every query below joins through this so "whale" always
+ * means cumulative-per-actor, never a single trade's size.
+ * Placeholders: [windowStart, windowStart, minWhaleSol].
+ *
+ * Two variants: the funded one clusters wallets by known funding source
+ * (wallet_funding); the unfunded one falls back to actor == wallet. Picked
+ * per-call by whether wallet_funding exists yet, so an un-migrated database
+ * still gets correct (if unclustered) whale detection instead of an error.
+ */
+const ACTOR_TOTALS_CTE = `
+  actor_totals AS (
+    SELECT am.actor, t.mint,
+           SUM(CASE WHEN t.side='BUY' THEN t.sol_amount ELSE 0 END) AS buy_sol,
+           SUM(CASE WHEN t.side='SELL' THEN t.sol_amount ELSE 0 END) AS sell_sol,
+           COUNT(DISTINCT t.wallet) AS wallet_count
+    FROM trades t
+    JOIN actor_map am ON am.wallet = t.wallet
+    WHERE t.ts >= ?
+    GROUP BY am.actor, t.mint
+  ),
+  whale_actors AS (
+    SELECT actor, mint, wallet_count FROM actor_totals WHERE (buy_sol + sell_sol) >= ?
+  )
+`;
+const WHALE_CTE_FUNDED = `
+  WITH actor_map AS (
+    SELECT DISTINCT t.wallet, COALESCE(wf.funded_by, t.wallet) AS actor
+    FROM trades t
+    LEFT JOIN wallet_funding wf ON wf.wallet = t.wallet
+    WHERE t.ts >= ?
+  ),
+  ${ACTOR_TOTALS_CTE}
+`;
+const WHALE_CTE_UNFUNDED = `
+  WITH actor_map AS (
+    SELECT DISTINCT t.wallet, t.wallet AS actor
+    FROM trades t
+    WHERE t.ts >= ?
+  ),
+  ${ACTOR_TOTALS_CTE}
+`;
+
+async function tableExists(env, name) {
+  try {
+    const row = await env.DB.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`
+    )
+      .bind(name)
+      .first();
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
 async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
   const windowStart = Math.floor(Date.now() / 1000) - windowSeconds;
   const bucketSeconds = Math.max(60, Math.floor(windowSeconds / 24)); // always ~24 buckets for the pulse chart
+  const minWhaleSol = parseFloat(env.MIN_TRADE_SOL || "25");
+  const cteArgs = [windowStart, windowStart, minWhaleSol];
+  const WHALE_CTE = (await tableExists(env, "wallet_funding")) ? WHALE_CTE_FUNDED : WHALE_CTE_UNFUNDED;
 
   const flows = await env.DB.prepare(
-    `SELECT t.mint, tm.symbol AS symbol,
-            SUM(CASE WHEN side='BUY'  THEN sol_amount ELSE 0 END) AS buy_sol,
-            SUM(CASE WHEN side='SELL' THEN sol_amount ELSE 0 END) AS sell_sol,
-            SUM(CASE WHEN side='BUY'  THEN usd_amount ELSE 0 END) AS buy_usd,
-            SUM(CASE WHEN side='SELL' THEN usd_amount ELSE 0 END) AS sell_usd,
-            COUNT(*)                       AS trades,
-            COUNT(DISTINCT wallet)         AS whales
-     FROM trades t
-     LEFT JOIN token_meta tm ON tm.mint = t.mint
-     WHERE ts >= ?
-     GROUP BY t.mint
-     ORDER BY (buy_sol - sell_sol) DESC`
-  ).bind(windowStart).all();
+    WHALE_CTE +
+      `SELECT t.mint, tm.symbol AS symbol,
+              SUM(CASE WHEN t.side='BUY'  THEN t.sol_amount ELSE 0 END) AS buy_sol,
+              SUM(CASE WHEN t.side='SELL' THEN t.sol_amount ELSE 0 END) AS sell_sol,
+              SUM(CASE WHEN t.side='BUY'  THEN t.usd_amount ELSE 0 END) AS buy_usd,
+              SUM(CASE WHEN t.side='SELL' THEN t.usd_amount ELSE 0 END) AS sell_usd,
+              COUNT(*)                                                       AS trades,
+              COUNT(DISTINCT t.wallet)                                       AS whales,
+              COUNT(DISTINCT wa.actor)                                       AS actors,
+              COUNT(DISTINCT CASE WHEN wa.wallet_count > 1 THEN wa.actor END) AS sybil_actors
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       LEFT JOIN token_meta tm ON tm.mint = t.mint
+       WHERE t.ts >= ?
+       GROUP BY t.mint
+       ORDER BY (buy_sol - sell_sol) DESC`
+  ).bind(...cteArgs, windowStart).all();
 
   const recent = await env.DB.prepare(
-    `SELECT t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount
-     FROM trades t
-     LEFT JOIN token_meta tm ON tm.mint = t.mint
-     ORDER BY t.ts DESC LIMIT 30`
-  ).all();
+    WHALE_CTE +
+      `SELECT t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount, wa.wallet_count
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       LEFT JOIN token_meta tm ON tm.mint = t.mint
+       WHERE t.ts >= ?
+       ORDER BY t.ts DESC LIMIT 30`
+  ).bind(...cteArgs, windowStart).all();
 
   const verdict = await env.DB.prepare(
     `SELECT created_at, summary FROM verdicts ORDER BY id DESC LIMIT 1`
@@ -355,11 +522,30 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
 
   // bucketed net flow across the window, for the pulse chart (~24 buckets)
   const buckets = await env.DB.prepare(
-    `SELECT CAST(ts/? AS INTEGER) AS bucket,
-            SUM(CASE WHEN side='BUY' THEN sol_amount ELSE -sol_amount END) AS net
-     FROM trades WHERE ts >= ?
-     GROUP BY bucket ORDER BY bucket`
-  ).bind(bucketSeconds, windowStart).all();
+    WHALE_CTE +
+      `SELECT CAST(t.ts/? AS INTEGER) AS bucket,
+              SUM(CASE WHEN t.side='BUY' THEN t.sol_amount ELSE -t.sol_amount END) AS net
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       WHERE t.ts >= ?
+       GROUP BY bucket ORDER BY bucket`
+  ).bind(...cteArgs, bucketSeconds, windowStart).all();
+
+  // multi-wallet actors ("clusters") for the Wallet clusters panel
+  const clusters = await env.DB.prepare(
+    WHALE_CTE +
+      `SELECT wa.actor, t.mint, tm.symbol AS symbol, wa.wallet_count,
+              SUM(t.sol_amount) AS total_sol, SUM(t.usd_amount) AS total_usd
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       LEFT JOIN token_meta tm ON tm.mint = t.mint
+       WHERE t.ts >= ? AND wa.wallet_count > 1
+       GROUP BY wa.actor, t.mint
+       ORDER BY total_sol DESC
+       LIMIT 10`
+  ).bind(...cteArgs, windowStart).all();
 
   const totals = flows.results
     ? flows.results.reduce(
@@ -367,11 +553,13 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
           net: a.net + (f.buy_sol - f.sell_sol),
           netUsd: a.netUsd + ((f.buy_usd || 0) - (f.sell_usd || 0)),
           whales: a.whales + f.whales,
+          actors: a.actors + f.actors,
+          sybilActors: a.sybilActors + f.sybil_actors,
           trades: a.trades + f.trades,
         }),
-        { net: 0, netUsd: 0, whales: 0, trades: 0 }
+        { net: 0, netUsd: 0, whales: 0, actors: 0, sybilActors: 0, trades: 0 }
       )
-    : { net: 0, netUsd: 0, whales: 0, trades: 0 };
+    : { net: 0, netUsd: 0, whales: 0, actors: 0, sybilActors: 0, trades: 0 };
 
   return {
     flows: flows.results || [],
@@ -379,6 +567,7 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
     verdict,
     buckets: buckets.results || [],
     bucketSeconds,
+    clusters: clusters.results || [],
     totals,
   };
 }
@@ -394,9 +583,11 @@ async function runAnalyst(env) {
       f.buy_usd || f.sell_usd
         ? ` (≈$${fmtUsd(f.buy_usd)} bought / $${fmtUsd(f.sell_usd)} sold)`
         : "";
+    const walletNote =
+      f.whales > f.actors ? `, using ${f.whales} wallets (${f.sybil_actors} likely split across wallets)` : "";
     return (
       `${tokenLabel(f)}: buys ${f.buy_sol.toFixed(1)} SOL, sells ${f.sell_sol.toFixed(1)} SOL${usdNote}, ` +
-      `net ${(f.buy_sol - f.sell_sol).toFixed(1)} SOL across ${f.trades} trades by ${f.whales} unique whales`
+      `net ${(f.buy_sol - f.sell_sol).toFixed(1)} SOL across ${f.trades} trades by ${f.actors} whales${walletNote}`
     );
   });
 
@@ -419,9 +610,12 @@ async function runAnalyst(env) {
               role: "user",
               content:
                 "You are a whale-flow analyst for Solana memecoins. " +
-                "Given 24h whale flow data (trades >= a SOL threshold), state for each token: " +
-                "accumulation vs distribution, conviction (how concentrated the buying is vs unique whales), " +
-                "and one risk note. Be terse, no hedging boilerplate.\n\nDATA:\n" +
+                "Given 24h whale flow data (a 'whale' is an actor whose cumulative volume clears a SOL threshold; " +
+                "actors using multiple wallets funded from the same source are already merged into one), state " +
+                "for each token: accumulation vs distribution, conviction (how concentrated the buying is vs " +
+                "unique whales), and one risk note — flag it if a big share of the flow is coming from wallets " +
+                "split across a shared funder, since that often means fewer real independent buyers than it looks. " +
+                "Be terse, no hedging boilerplate.\n\nDATA:\n" +
                 lines.join("\n"),
             },
           ],
@@ -454,7 +648,7 @@ async function dashboard(env, window) {
     );
   }
 
-  const { flows, recent, verdict, buckets, bucketSeconds, totals } = data;
+  const { flows, recent, verdict, buckets, bucketSeconds, clusters, totals } = data;
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
   let market = {};
@@ -510,6 +704,7 @@ async function dashboard(env, window) {
           <span class="rank"${i < 3 ? ` style="color:${RANK_COLORS[i]}"` : ""}>#${i + 1}</span>
           <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">${escapeHtml(tokenLabel(f))}</a>
           ${chg != null ? `<span class="chg ${chg >= 0 ? "pos" : "neg"}">${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%</span>` : ""}
+          ${f.sybil_actors > 0 ? `<span class="warn" title="${f.sybil_actors} of these whales trade through more than one wallet sharing a funder">${f.sybil_actors} clustered</span>` : ""}
           <span class="meta">${metaLine}</span>
         </div>
         <div class="frow-body">
@@ -538,9 +733,17 @@ async function dashboard(env, window) {
         <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
         <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
         <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
-        <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}</a>
+        <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}${r.wallet_count > 1 ? '<b class="dot" title="Part of a multi-wallet cluster"></b>' : ""}</a>
       </div>`;
     })
+    .join("");
+
+  const clusterRows = clusters
+    .map((c, i) => `<div class="crow"${i === 0 ? ' style="border-top:none"' : ""}>
+        <span class="csym">${escapeHtml(tokenLabel(c))}</span>
+        <span class="cfunder">funder ${short(c.actor)} → ${c.wallet_count} wallets</span>
+        <span class="ctot">${c.total_sol.toFixed(1)} SOL${c.total_usd ? ` · $${fmtUsd(c.total_usd)}` : ""}</span>
+      </div>`)
     .join("");
 
   const html = `<!doctype html><html><head><meta charset="utf-8">
@@ -581,6 +784,7 @@ async function dashboard(env, window) {
   .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums}
   .chg.pos{background:rgba(18,184,134,.12);color:var(--teal)}
   .chg.neg{background:rgba(255,90,77,.12);color:var(--coral)}
+  .warn{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(230,161,20,.14);color:#b8860b}
   .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
   .frow-body{display:flex;align-items:center;gap:12px}
   .axis{flex:1;display:flex;align-items:center;height:14px}
@@ -602,8 +806,13 @@ async function dashboard(env, window) {
   .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
   .tusd{font-weight:400;color:var(--mut);font-size:10px}
   .tsym{color:var(--mut);padding-left:8px}
-  .tw{text-align:right;color:var(--mut2);text-decoration:none}
+  .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
+  .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
   .empty{color:var(--mut);padding:10px 0;font-size:13px}
+  .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .csym{font-weight:600;flex:none}
+  .cfunder{color:var(--mut);flex:1}
+  .ctot{font-weight:600;font-variant-numeric:tabular-nums;flex:none}
 </style></head><body>
 
 <div class="hero">
@@ -614,7 +823,7 @@ async function dashboard(env, window) {
   <div class="tf">
     ${Object.keys(WINDOWS).map((w) => `<a href="/?window=${w}"${w === window ? ' class="tfa"' : ""}>${WINDOW_LABELS[w]}</a>`).join("")}
   </div>
-  <div class="hlab">Net flow · ${WINDOW_LABELS[window]} · all tokens · ≥${minSol} SOL</div>
+  <div class="hlab">Net flow · ${WINDOW_LABELS[window]} · all tokens · ≥${minSol} SOL cumulative per whale</div>
   <div style="display:flex;align-items:baseline">
     <span class="hero-num" style="color:${heroColor}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
     <span class="hsub">SOL ${netPos ? "accumulated" : "distributed"}</span>
@@ -624,7 +833,7 @@ async function dashboard(env, window) {
 </div>
 
 <div class="cards">
-  <div class="card"><div class="clab">Whales</div><div class="cnum">${totals.whales}</div><div class="csub">${totals.trades} trades</div></div>
+  <div class="card"><div class="clab">Whales</div><div class="cnum">${totals.actors}</div><div class="csub">${totals.whales} wallets${totals.sybilActors ? ` · ${totals.sybilActors} clustered` : ""} · ${totals.trades} trades</div></div>
   <div class="card"><div class="clab">Buys</div><div class="cnum pos">${flows.filter(f=>f.buy_sol>0).length}</div><div class="csub">${Math.round(buySol)} SOL${buyUsd ? " · $" + fmtUsd(buyUsd) : ""}</div></div>
   <div class="card"><div class="clab">Sells</div><div class="cnum neg">${flows.filter(f=>f.sell_sol>0).length}</div><div class="csub">${Math.round(sellSol)} SOL${sellUsd ? " · $" + fmtUsd(sellUsd) : ""}</div></div>
 </div>
@@ -633,6 +842,11 @@ async function dashboard(env, window) {
   <div class="phead"><span>By token</span><span style="color:#c4c4ca">sell ◂ ▸ buy</span></div>
   ${flows.length ? flowRows : `<div class="empty">No whale trades yet. Once Helius fires, flows appear here.</div>`}
 </div>
+
+${clusters.length ? `<div class="panel">
+  <div class="phead"><span>Wallet clusters</span><span style="color:#c4c4ca">same funder, multiple wallets</span></div>
+  ${clusterRows}
+</div>` : ""}
 
 <div class="disp">
   <div class="phead"><span>Analyst dispatch · every 6h</span></div>

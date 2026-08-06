@@ -6,14 +6,18 @@ A tiny agent pipeline that **accumulates Solana whale flows while you sleep**, r
 Helius (watches the chain, free tier)
    │  pushes every swap on your watchlist tokens
    ▼
-Cloudflare Worker  /webhook     ← the COLLECTOR: keeps trades ≥ 25 SOL, prices them in USD
-   ▼                              and resolves symbols via Jupiter (free, no key)
-Cloudflare D1 database          ← the MEMORY: every whale trade, forever
-   ▼
+Cloudflare Worker  /webhook     ← the COLLECTOR: stores every swap ≥ DUST_FLOOR_SOL, prices
+   ▼                              them in USD and resolves symbols via Jupiter (free, no key)
+Cloudflare D1 database          ← the MEMORY: every trade, forever, plus each wallet's
+   ▼                              best-effort funding source (via Helius, optional)
+Query time                      ← "whale" = an actor (wallet, or wallets sharing a funder)
+   ▼                              whose CUMULATIVE volume clears MIN_TRADE_SOL in the window —
+   ▼                              catches a big buy split into many small ones
 Cron every 6 hours              ← the ANALYST: Claude summarises accumulation vs distribution
    ▼
 Your worker URL                 ← the DASHBOARD: ranked flows in SOL & USD, live market stats
-                                   (price, mcap, liquidity, whale dominance), 1H/6H/24H/7D toggle
+                                   (price, mcap, liquidity, whale dominance), wallet clusters,
+                                   1H/6H/24H/7D toggle
 ```
 
 Your **watchlist lives in Helius**, not in code — add or remove a token by editing the webhook in the Helius dashboard. No redeploys.
@@ -62,7 +66,16 @@ Your **watchlist lives in Helius**, not in code — add or remove a token by edi
 >   volume_24h       REAL,
 >   updated_at       INTEGER NOT NULL
 > );
+> -- if you don't have split-transaction / multi-wallet detection yet
+> CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades (wallet, ts);
+> CREATE TABLE IF NOT EXISTS wallet_funding (
+>   wallet     TEXT PRIMARY KEY,
+>   funded_by  TEXT,
+>   checked_at INTEGER NOT NULL
+> );
 > ```
+>
+> **Important:** after this migration, "whale" detection changes from "any single trade ≥ `MIN_TRADE_SOL`" to "cumulative volume ≥ `MIN_TRADE_SOL` per actor within the selected window" — see [How whale detection works](#how-whale-detection-works) below. Your Helius webhook config doesn't need to change (it already sends every swap on your watchlist; the size filtering always happened in the Worker, not in Helius).
 
 ### Step 4 — Set your settings
 Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Variables and Secrets** → add:
@@ -70,12 +83,18 @@ Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Vari
 | Name | Value |
 |---|---|
 | `WEBHOOK_SECRET` | invent a password, e.g. `radar-9-lives-2026` (no spaces) |
-| `MIN_TRADE_SOL` | `25` (or whatever "whale" means to you) |
+| `MIN_TRADE_SOL` | `25` (or whatever "whale" means to you) — this is now a **cumulative per-actor** threshold, not a single trade size, see below |
+| `DUST_FLOOR_SOL` | *(optional, default `1`)* the smallest single trade worth storing at all — lower catches finer-grained split-transaction structuring, at the cost of more D1 writes |
 | `ANTHROPIC_API_KEY` | *(optional)* an API key from console.anthropic.com — turns on the AI analyst |
+| `HELIUS_API_KEY` | *(optional)* an API key from your Helius dashboard (Settings → API Keys — different from the webhook secret) — turns on wallet-funding lookups, which cluster whale activity split across multiple wallets |
 
 Click Deploy/Save after adding them.
 
 USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag); live price change, market cap, liquidity, and volume use DexScreener's free public API (api.dexscreener.com). Neither needs a key, signup, or extra setting.
+
+### How whale detection works
+
+Filtering by single-trade size is trivial to bypass — split one 100 SOL buy into ten 10 SOL buys and a naive `sol_amount >= threshold` check never fires. So this doesn't filter at ingestion: it stores every trade above the tiny `DUST_FLOOR_SOL` floor, then at query time groups trades by **actor** — a wallet, or (if `HELIUS_API_KEY` is set) a cluster of wallets that all received their SOL from the same funding address — and checks whether that actor's *cumulative* buy+sell volume in the selected time window clears `MIN_TRADE_SOL`. Qualifying actors' full trade history in the window counts toward flows, not just the trade that tipped them over. Without `HELIUS_API_KEY`, an actor is just its own wallet (still fixes the split-transaction case); with it, wallets funded from a shared source are merged into one actor (also catches the split-*wallet* case) and surfaced in the **Wallet clusters** panel.
 
 ### Step 5 — Point Helius at it
 1. Sign up free at helius.dev → dashboard → **Webhooks** → **New Webhook**.
@@ -88,23 +107,24 @@ USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag); l
 6. Save.
 
 ### Step 6 — Watch it fill up
-Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first ≥25 SOL trade on a watched token, rows appear. The first analyst verdict lands on the next 6-hour mark.
+Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first trade that pushes a wallet's cumulative volume on a watched token past your `MIN_TRADE_SOL`, rows appear. The first analyst verdict lands on the next 6-hour mark.
 
 ---
 
 ## Daily use
 
-- **Dashboard**: your worker URL. Ranked token leaderboard (rank, price change, market cap, liquidity, whale-dominance %), net flow bars, unique whale counts, recent big trades (each wallet links to its GMGN profile — that's your bootstrap smart-money research).
+- **Dashboard**: your worker URL. Ranked token leaderboard (rank, price change, market cap, liquidity, whale-dominance %), net flow bars, whale/wallet/cluster counts, recent big trades (each wallet links to its GMGN profile — that's your bootstrap smart-money research).
 - **Timeframe**: click **1H / 6H / 24H / 7D** at the top of the dashboard, or append `?window=6h` (also `1h`, `24h`, `7d`) to the URL — every number on the page recalculates for that window.
 - **Whale dominance**: the thin bar under each token shows whale-sized volume (your DB) as a % of that token's total DEX volume (DexScreener) for the selected window — a rough conviction signal, high = whales are most of the action, low = whale trades are a drop in a much bigger bucket.
+- **Wallet clusters**: when `HELIUS_API_KEY` is set, a panel lists actors whose whale-qualifying volume came from more than one wallet sharing a funding source — a small amber "N clustered" badge also appears next to any token with clustered whales, and a dot marks clustered wallets in the recent-trades list.
 - **Change watchlist**: Helius dashboard → edit webhook → add/remove CAs.
-- **Change whale threshold**: Cloudflare → worker → Settings → `MIN_TRADE_SOL`.
+- **Change whale threshold**: Cloudflare → worker → Settings → `MIN_TRADE_SOL` (cumulative per actor, not per trade — see [How whale detection works](#how-whale-detection-works)).
 - **Raw data**: `/api/flows` (optionally `?window=`) returns everything as JSON — paste it into a Claude chat for deeper analysis.
 
 ## Costs
 
-- Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — far more than this needs.
-- Helius free tier: enough webhook capacity for a small watchlist.
+- Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — should still be plenty for a small watchlist, but note that storing every trade above `DUST_FLOOR_SOL` (instead of only trades already past the whale threshold) means noticeably more D1 writes than earlier versions on an active token. Raise `DUST_FLOOR_SOL` if you're worried about volume.
+- Helius free tier: enough webhook capacity for a small watchlist; the optional funding-source lookup uses Helius's Enhanced Transactions API, called once per newly-seen wallet then cached for 2 weeks.
 - Jupiter Price/Token API and DexScreener API: both free tier, no key required.
 - Claude API analyst: optional; 4 short calls/day ≈ a few cents.
 
@@ -114,7 +134,8 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 - Market stats (price change, market cap, liquidity, volume, whale dominance) are *live*, from DexScreener, cached for ~90 seconds — unlike trade USD values, these reflect right now, not the moment of the trade. A token with no indexed DexScreener pair yet just won't show them.
 - Token symbols come from Jupiter's token list; very new or unlisted tokens may still show as a shortened contract address until Jupiter indexes them.
 - Very early **pump.fun bonding-curve** trades don't always parse as clean swaps; tokens that have migrated (Raydium/PumpSwap) work best.
-- "Whale" = trade size only. Labeling *which wallets* are historically good traders (a true smart-money score) is Phase 2 — the wallet links on the dashboard are how you start building that list manually.
+- Wallet-funding clustering looks at each wallet's most recent handful of transfers, not a full recursive funding graph — it catches naive same-source sybil wallets, not a determined actor routing through several hops or a CEX withdrawal per wallet. It can also mislabel a DEX/router address as the "funder" if that's genuinely the most recent SOL inflow (e.g. proceeds from an earlier sell). Treat clusters as a strong hint, not proof.
+- "Whale" = size (now cumulative per actor, not per trade). Scoring *which* wallets are historically good traders (a true smart-money/PnL score) is still future work — the wallet links on the dashboard are how you start building that list manually.
 
 ## Troubleshooting
 
