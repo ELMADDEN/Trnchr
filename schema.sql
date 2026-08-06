@@ -13,8 +13,9 @@ CREATE TABLE IF NOT EXISTS trades (
   received_at INTEGER NOT NULL       -- when the webhook arrived
 );
 
-CREATE INDEX IF NOT EXISTS idx_trades_mint_ts ON trades (mint, ts);
-CREATE INDEX IF NOT EXISTS idx_trades_wallet  ON trades (wallet);
+CREATE INDEX IF NOT EXISTS idx_trades_mint_ts   ON trades (mint, ts);
+CREATE INDEX IF NOT EXISTS idx_trades_wallet     ON trades (wallet);
+CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts  ON trades (wallet, ts);
 
 CREATE TABLE IF NOT EXISTS verdicts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,4 +44,15 @@ CREATE TABLE IF NOT EXISTS market_cache (
   volume_6h        REAL,
   volume_24h       REAL,
   updated_at       INTEGER NOT NULL  -- unix timestamp of last refresh
+);
+
+-- Best-effort cache of each wallet's most recent external SOL funder, used
+-- to cluster split-across-wallets whale activity into one "actor". Only
+-- populated when HELIUS_API_KEY is set; a NULL funded_by just means the
+-- wallet is treated as its own actor (which is also the correct fallback
+-- when this table is empty entirely).
+CREATE TABLE IF NOT EXISTS wallet_funding (
+  wallet     TEXT PRIMARY KEY,       -- the trader's wallet address
+  funded_by  TEXT,                   -- best-effort: address that most recently sent it SOL
+  checked_at INTEGER NOT NULL        -- unix timestamp of last lookup
 );
