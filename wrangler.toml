@@ -1,0 +1,16 @@
+name = "whale-radar"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# Cron: the analyst runs every 6 hours (UTC)
+[triggers]
+crons = ["0 */6 * * *"]
+
+# D1 database binding.
+# After you create the database in the Cloudflare dashboard,
+# replace REPLACE_ME_WITH_YOUR_DATABASE_ID below with the real ID
+# (edit this file directly on GitHub - pencil icon - and commit).
+[[d1_databases]]
+binding = "DB"
+database_name = "whale-radar-db"
+database_id = "REPLACE_ME_WITH_YOUR_DATABASE_ID"
