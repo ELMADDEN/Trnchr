@@ -12,7 +12,8 @@ Cloudflare D1 database          ← the MEMORY: every whale trade, forever
    ▼
 Cron every 6 hours              ← the ANALYST: Claude summarises accumulation vs distribution
    ▼
-Your worker URL                 ← the DASHBOARD: net flows in SOL & USD, bars, verdicts
+Your worker URL                 ← the DASHBOARD: ranked flows in SOL & USD, live market stats
+                                   (price, mcap, liquidity, whale dominance), 1H/6H/24H/7D toggle
 ```
 
 Your **watchlist lives in Helius**, not in code — add or remove a token by editing the webhook in the Helius dashboard. No redeploys.
@@ -39,14 +40,27 @@ Your **watchlist lives in Helius**, not in code — add or remove a token by edi
 3. Go back to your GitHub repo → open `wrangler.toml` → click the **pencil icon** → replace `REPLACE_ME_WITH_YOUR_DATABASE_ID` with the ID you copied → **Commit changes**. Cloudflare redeploys automatically (watch it under your worker → Deployments).
 4. Back in Cloudflare → your D1 database → **Console** tab → paste the entire contents of `schema.sql` → **Execute**.
 
-> **Already have a whale-radar database from before USD pricing?** Run this once in the same D1 console instead of the full `schema.sql` (it only adds what's new, existing trades are untouched):
+> **Upgrading an older whale-radar database?** Run whichever of these you're missing once in the same D1 console instead of the full `schema.sql` (existing trades are untouched):
 > ```sql
+> -- if you don't have USD pricing / symbols yet
 > ALTER TABLE trades ADD COLUMN usd_amount REAL;
 > CREATE TABLE IF NOT EXISTS token_meta (
 >   mint       TEXT PRIMARY KEY,
 >   symbol     TEXT,
 >   name       TEXT,
 >   updated_at INTEGER NOT NULL
+> );
+> -- if you don't have live market stats yet (price change, market cap, liquidity, volume)
+> CREATE TABLE IF NOT EXISTS market_cache (
+>   mint             TEXT PRIMARY KEY,
+>   price_usd        REAL,
+>   price_change_24h REAL,
+>   liquidity_usd    REAL,
+>   market_cap       REAL,
+>   volume_1h        REAL,
+>   volume_6h        REAL,
+>   volume_24h       REAL,
+>   updated_at       INTEGER NOT NULL
 > );
 > ```
 
@@ -61,7 +75,7 @@ Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Vari
 
 Click Deploy/Save after adding them.
 
-USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag) — no key, signup, or extra setting needed.
+USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag); live price change, market cap, liquidity, and volume use DexScreener's free public API (api.dexscreener.com). Neither needs a key, signup, or extra setting.
 
 ### Step 5 — Point Helius at it
 1. Sign up free at helius.dev → dashboard → **Webhooks** → **New Webhook**.
@@ -80,24 +94,27 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 
 ## Daily use
 
-- **Dashboard**: your worker URL. Net flow bars per token, unique whale counts, recent big trades (each wallet links to its GMGN profile — that's your bootstrap smart-money research).
+- **Dashboard**: your worker URL. Ranked token leaderboard (rank, price change, market cap, liquidity, whale-dominance %), net flow bars, unique whale counts, recent big trades (each wallet links to its GMGN profile — that's your bootstrap smart-money research).
+- **Timeframe**: click **1H / 6H / 24H / 7D** at the top of the dashboard, or append `?window=6h` (also `1h`, `24h`, `7d`) to the URL — every number on the page recalculates for that window.
+- **Whale dominance**: the thin bar under each token shows whale-sized volume (your DB) as a % of that token's total DEX volume (DexScreener) for the selected window — a rough conviction signal, high = whales are most of the action, low = whale trades are a drop in a much bigger bucket.
 - **Change watchlist**: Helius dashboard → edit webhook → add/remove CAs.
 - **Change whale threshold**: Cloudflare → worker → Settings → `MIN_TRADE_SOL`.
-- **Raw data**: `/api/flows` returns everything as JSON — paste it into a Claude chat for deeper analysis.
+- **Raw data**: `/api/flows` (optionally `?window=`) returns everything as JSON — paste it into a Claude chat for deeper analysis.
 
 ## Costs
 
 - Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — far more than this needs.
 - Helius free tier: enough webhook capacity for a small watchlist.
-- Jupiter Price/Token API: free tier, no key required.
+- Jupiter Price/Token API and DexScreener API: both free tier, no key required.
 - Claude API analyst: optional; 4 short calls/day ≈ a few cents.
 
 ## Honest limitations (v1)
 
-- USD values are the SOL price *at the moment the trade was recorded*, from Jupiter — if Jupiter is briefly unreachable, that trade's USD figure is left blank (SOL figure is always exact, since it comes straight off-chain).
+- USD trade values are the SOL price *at the moment the trade was recorded*, from Jupiter — if Jupiter is briefly unreachable, that trade's USD figure is left blank (SOL figure is always exact, since it comes straight off-chain).
+- Market stats (price change, market cap, liquidity, volume, whale dominance) are *live*, from DexScreener, cached for ~90 seconds — unlike trade USD values, these reflect right now, not the moment of the trade. A token with no indexed DexScreener pair yet just won't show them.
 - Token symbols come from Jupiter's token list; very new or unlisted tokens may still show as a shortened contract address until Jupiter indexes them.
 - Very early **pump.fun bonding-curve** trades don't always parse as clean swaps; tokens that have migrated (Raydium/PumpSwap) work best.
-- "Whale" = trade size only. Labeling *which* wallets are smart money is Phase 2 — the wallet links on the dashboard are how you start building that list manually.
+- "Whale" = trade size only. Labeling *which wallets* are historically good traders (a true smart-money score) is Phase 2 — the wallet links on the dashboard are how you start building that list manually.
 
 ## Troubleshooting
 

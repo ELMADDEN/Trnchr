@@ -15,15 +15,26 @@
  *   ANTHROPIC_API_KEY   optional — enables the AI analyst
  *
  * USD pricing and token symbols come from Jupiter's free public API
- * (lite-api.jup.ag — no key or signup needed). Both are best-effort: if
- * Jupiter is unreachable, trades still record with usd_amount = NULL and
- * the dashboard falls back to showing the raw mint address.
+ * (lite-api.jup.ag — no key or signup needed). Live market stats (price
+ * change, market cap, liquidity, volume) come from DexScreener's free
+ * public API. All three are best-effort: if a lookup fails, the affected
+ * figures are just left blank instead of breaking the page.
+ *
+ * The dashboard supports a ?window= query param (1h, 6h, 24h, 7d) that
+ * controls every stat on the page, e.g. /?window=6h.
  */
 
 const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3";
 const JUPITER_TOKEN_URL = "https://lite-api.jup.ag/tokens/v2/search";
-const TOKEN_META_TTL = 7 * 86400; // refresh cached symbols weekly
+const DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana";
+const TOKEN_META_TTL = 7 * 86400;   // refresh cached symbols weekly
+const MARKET_CACHE_TTL = 90;        // refresh cached market stats every 90s
+
+const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
+const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
+const parseWindow = (url) => (WINDOWS[url.searchParams.get("window")] ? url.searchParams.get("window") : "24h");
+const RANK_COLORS = ["#d4af37", "#a8a8b0", "#c98a4b"]; // gold / silver / bronze accents for the top 3 rows
 
 export default {
   // ---------------------------------------------------------------- HTTP ----
@@ -34,11 +45,12 @@ export default {
       return handleWebhook(request, url, env);
     }
     if (url.pathname === "/api/flows") {
-      const data = await getFlows(env);
-      return json(data);
+      const window = parseWindow(url);
+      const data = await getFlows(env, WINDOWS[window]);
+      return json({ window, ...data });
     }
     if (url.pathname === "/") {
-      return dashboard(env);
+      return dashboard(env, parseWindow(url));
     }
     return new Response("Not found", { status: 404 });
   },
@@ -184,6 +196,99 @@ async function resolveTokenMeta(env, mints) {
   return meta;
 }
 
+/**
+ * Live market stats (price, 24h change, market cap, liquidity, volume)
+ * per mint via a local D1 cache backed by DexScreener. A mint can have
+ * several pools; the deepest-liquidity pair is used. Returns a map keyed
+ * by mint; entries are omitted when neither the cache nor DexScreener has
+ * data for that mint (e.g. a token with no indexed pair yet).
+ */
+async function getMarketData(env, mints) {
+  const unique = [...new Set(mints)];
+  if (!unique.length) return {};
+
+  const now = Math.floor(Date.now() / 1000);
+  const placeholders = unique.map(() => "?").join(",");
+  const cached = await env.DB.prepare(
+    `SELECT * FROM market_cache WHERE mint IN (${placeholders})`
+  )
+    .bind(...unique)
+    .all();
+
+  const cachedByMint = {};
+  (cached.results || []).forEach((r) => (cachedByMint[r.mint] = r));
+
+  const market = {};
+  const stale = [];
+  for (const mint of unique) {
+    const c = cachedByMint[mint];
+    if (c && now - c.updated_at < MARKET_CACHE_TTL) {
+      market[mint] = c;
+    } else {
+      stale.push(mint);
+    }
+  }
+
+  if (stale.length) {
+    try {
+      const res = await fetch(`${DEXSCREENER_URL}/${stale.join(",")}`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      if (res.ok) {
+        const pairs = await res.json();
+        const bestByMint = {};
+        for (const p of Array.isArray(pairs) ? pairs : []) {
+          const mint = p?.baseToken?.address;
+          if (!mint || !stale.includes(mint)) continue;
+          const liq = p.liquidity?.usd || 0;
+          if (!bestByMint[mint] || liq > (bestByMint[mint].liquidity?.usd || 0)) {
+            bestByMint[mint] = p;
+          }
+        }
+        for (const mint of Object.keys(bestByMint)) {
+          const p = bestByMint[mint];
+          const row = {
+            mint,
+            price_usd: p.priceUsd != null ? Number(p.priceUsd) : null,
+            price_change_24h: p.priceChange?.h24 ?? null,
+            liquidity_usd: p.liquidity?.usd ?? null,
+            market_cap: p.marketCap ?? p.fdv ?? null,
+            volume_1h: p.volume?.h1 ?? null,
+            volume_6h: p.volume?.h6 ?? null,
+            volume_24h: p.volume?.h24 ?? null,
+            updated_at: now,
+          };
+          market[mint] = row;
+          await env.DB.prepare(
+            `INSERT INTO market_cache
+             (mint, price_usd, price_change_24h, liquidity_usd, market_cap, volume_1h, volume_6h, volume_24h, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(mint) DO UPDATE SET
+               price_usd=excluded.price_usd, price_change_24h=excluded.price_change_24h,
+               liquidity_usd=excluded.liquidity_usd, market_cap=excluded.market_cap,
+               volume_1h=excluded.volume_1h, volume_6h=excluded.volume_6h, volume_24h=excluded.volume_24h,
+               updated_at=excluded.updated_at`
+          )
+            .bind(
+              row.mint, row.price_usd, row.price_change_24h, row.liquidity_usd,
+              row.market_cap, row.volume_1h, row.volume_6h, row.volume_24h, now
+            )
+            .run();
+        }
+      }
+    } catch (e) {
+      console.log("dexscreener error", e.message);
+    }
+    // DexScreener may not have an indexed pair for every mint yet — fall
+    // back to whatever we had cached for those, even if stale.
+    for (const mint of stale) {
+      if (!market[mint] && cachedByMint[mint]) market[mint] = cachedByMint[mint];
+    }
+  }
+
+  return market;
+}
+
 /** Turn a Helius "enhanced" transaction into {signature, ts, wallet, mint, side, sol_amount} or null. */
 function parseSwap(tx) {
   const swap = tx?.events?.swap;
@@ -218,8 +323,9 @@ function parseSwap(tx) {
 
 // ============================================================ QUERIES ======
 
-async function getFlows(env) {
-  const dayAgo = Math.floor(Date.now() / 1000) - 86400;
+async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
+  const windowStart = Math.floor(Date.now() / 1000) - windowSeconds;
+  const bucketSeconds = Math.max(60, Math.floor(windowSeconds / 24)); // always ~24 buckets for the pulse chart
 
   const flows = await env.DB.prepare(
     `SELECT t.mint, tm.symbol AS symbol,
@@ -234,7 +340,7 @@ async function getFlows(env) {
      WHERE ts >= ?
      GROUP BY t.mint
      ORDER BY (buy_sol - sell_sol) DESC`
-  ).bind(dayAgo).all();
+  ).bind(windowStart).all();
 
   const recent = await env.DB.prepare(
     `SELECT t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount
@@ -247,13 +353,13 @@ async function getFlows(env) {
     `SELECT created_at, summary FROM verdicts ORDER BY id DESC LIMIT 1`
   ).first();
 
-  // hourly net flow for the last 24h chart
-  const hourly = await env.DB.prepare(
-    `SELECT CAST(ts/3600 AS INTEGER) AS hr,
+  // bucketed net flow across the window, for the pulse chart (~24 buckets)
+  const buckets = await env.DB.prepare(
+    `SELECT CAST(ts/? AS INTEGER) AS bucket,
             SUM(CASE WHEN side='BUY' THEN sol_amount ELSE -sol_amount END) AS net
      FROM trades WHERE ts >= ?
-     GROUP BY hr ORDER BY hr`
-  ).bind(dayAgo).all();
+     GROUP BY bucket ORDER BY bucket`
+  ).bind(bucketSeconds, windowStart).all();
 
   const totals = flows.results
     ? flows.results.reduce(
@@ -271,7 +377,8 @@ async function getFlows(env) {
     flows: flows.results || [],
     recent: recent.results || [],
     verdict,
-    hourly: hourly.results || [],
+    buckets: buckets.results || [],
+    bucketSeconds,
     totals,
   };
 }
@@ -279,7 +386,7 @@ async function getFlows(env) {
 // ============================================================ ANALYST ======
 
 async function runAnalyst(env) {
-  const { flows } = await getFlows(env);
+  const { flows } = await getFlows(env, WINDOWS["24h"]);
   if (!flows.length) return;
 
   const lines = flows.map((f) => {
@@ -335,10 +442,10 @@ async function runAnalyst(env) {
 
 // ============================================================ DASHBOARD ====
 
-async function dashboard(env) {
+async function dashboard(env, window) {
   let data;
   try {
-    data = await getFlows(env);
+    data = await getFlows(env, WINDOWS[window]);
   } catch (e) {
     return new Response(
       "Database not ready. Create the D1 database, paste schema.sql into its console, " +
@@ -347,9 +454,11 @@ async function dashboard(env) {
     );
   }
 
-  const { flows, recent, verdict, hourly, totals } = data;
+  const { flows, recent, verdict, buckets, bucketSeconds, totals } = data;
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
+  const market = await getMarketData(env, flows.map((f) => f.mint));
+  const dexVolField = window === "1h" ? "volume_1h" : window === "6h" ? "volume_6h" : "volume_24h";
 
   const netPos = totals.net >= 0;
   const heroColor = netPos ? "#12b886" : "#ff5a4d";
@@ -360,14 +469,14 @@ async function dashboard(env) {
     buyUsd += f.buy_usd || 0; sellUsd += f.sell_usd || 0;
   });
 
-  // 24h cumulative-net series for the dot pulse
-  const nowHr = Math.floor(Date.now() / 3600000);
-  const byHr = {};
-  hourly.forEach((h) => (byHr[h.hr] = h.net));
+  // cumulative-net series across the window for the dot pulse (~24 points)
+  const nowBucket = Math.floor(Date.now() / 1000 / bucketSeconds);
+  const byBucket = {};
+  buckets.forEach((b) => (byBucket[b.bucket] = b.net));
   const series = [];
   let cum = 0;
   for (let i = 23; i >= 0; i--) {
-    cum += byHr[nowHr - i] || 0;
+    cum += byBucket[nowBucket - i] || 0;
     series.push(Math.round(cum * 10) / 10);
   }
 
@@ -378,17 +487,36 @@ async function dashboard(env) {
       const pos = net >= 0;
       const sw = (f.sell_sol / maxFlow) * 50;
       const bw = (f.buy_sol / maxFlow) * 50;
+
+      const m = market[f.mint] || {};
+      const chg = m.price_change_24h;
+      const dexVol = m[dexVolField];
+      const whaleUsd = (f.buy_usd || 0) + (f.sell_usd || 0);
+      const dominance = window !== "7d" && dexVol ? Math.min(100, (whaleUsd / dexVol) * 100) : null;
+      const metaLine = [
+        m.market_cap ? `MC $${fmtUsd(m.market_cap)}` : "",
+        m.liquidity_usd ? `LP $${fmtUsd(m.liquidity_usd)}` : "",
+      ].filter(Boolean).join(" · ");
+
       return `<div class="frow"${i === 0 ? ' style="border-top:none"' : ""}>
-        <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">${escapeHtml(tokenLabel(f))}</a>
-        <span class="axis">
-          <span class="lft"><span class="sell" style="width:${sw}%"></span></span>
-          <span class="cen"></span>
-          <span class="rgt"><span class="buy" style="width:${bw}%"></span></span>
-        </span>
-        <span class="netcol">
-          <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)}</span>
-          ${netUsd ? `<span class="netusd">${netUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(netUsd))}</span>` : ""}
-        </span>
+        <div class="frow-head">
+          <span class="rank"${i < 3 ? ` style="color:${RANK_COLORS[i]}"` : ""}>#${i + 1}</span>
+          <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">${escapeHtml(tokenLabel(f))}</a>
+          ${chg != null ? `<span class="chg ${chg >= 0 ? "pos" : "neg"}">${chg >= 0 ? "+" : ""}${chg.toFixed(1)}%</span>` : ""}
+          <span class="meta">${metaLine}</span>
+        </div>
+        <div class="frow-body">
+          <span class="axis">
+            <span class="lft"><span class="sell" style="width:${sw}%"></span></span>
+            <span class="cen"></span>
+            <span class="rgt"><span class="buy" style="width:${bw}%"></span></span>
+          </span>
+          <span class="netcol">
+            <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)}</span>
+            ${netUsd ? `<span class="netusd">${netUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(netUsd))}</span>` : ""}
+          </span>
+        </div>
+        ${dominance != null ? `<div class="dom" title="Whale-sized volume as a share of ${WINDOW_LABELS[window]} DEX volume"><b style="width:${dominance}%"></b><span class="domlbl">${dominance.toFixed(0)}% whale-dominated</span></div>` : ""}
       </div>`;
     })
     .join("");
@@ -424,6 +552,9 @@ async function dashboard(env) {
   .htag{font-size:11px;color:#6b6b70;margin-left:9px}
   .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal)}
   .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block}
+  .tf{display:flex;gap:4px;margin-bottom:10px}
+  .tf a{font-size:11px;font-weight:600;color:#8a8a90;padding:4px 10px;border-radius:7px;text-decoration:none;background:rgba(255,255,255,.04)}
+  .tf a.tfa{background:#fff;color:var(--ink)}
   .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
   .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
   .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
@@ -436,17 +567,27 @@ async function dashboard(env) {
   .csub{font-size:11px;color:var(--mut);margin-top:2px}
   .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
-  .frow{display:grid;grid-template-columns:110px 1fr 84px;align-items:center;gap:12px;padding:9px 0;border-top:0.5px solid var(--line)}
-  .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none}
-  .axis{display:flex;align-items:center;height:14px}
+  .frow{padding:10px 0;border-top:0.5px solid var(--line)}
+  .frow-head{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+  .rank{font-size:11px;font-weight:700;color:var(--mut);flex:none;width:20px}
+  .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;flex:none}
+  .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums}
+  .chg.pos{background:rgba(18,184,134,.12);color:var(--teal)}
+  .chg.neg{background:rgba(255,90,77,.12);color:var(--coral)}
+  .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .frow-body{display:flex;align-items:center;gap:12px}
+  .axis{flex:1;display:flex;align-items:center;height:14px}
   .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
   .cen{width:1px;height:16px;background:#e0e0e4}
   .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
   .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
-  .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25}
+  .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25;flex:none;width:84px}
   .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
   .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums}
   .pos{color:var(--teal)}.neg{color:var(--coral)}
+  .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
+  .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
+  .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
   .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
   .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
@@ -463,13 +604,16 @@ async function dashboard(env) {
     <div><span class="brand">Trnchr</span><span class="htag">whale flow</span></div>
     <span class="live"><b></b>Collecting</span>
   </div>
-  <div class="hlab">Net flow · 24h · all tokens · ≥${minSol} SOL</div>
+  <div class="tf">
+    ${Object.keys(WINDOWS).map((w) => `<a href="/?window=${w}"${w === window ? ' class="tfa"' : ""}>${WINDOW_LABELS[w]}</a>`).join("")}
+  </div>
+  <div class="hlab">Net flow · ${WINDOW_LABELS[window]} · all tokens · ≥${minSol} SOL</div>
   <div style="display:flex;align-items:baseline">
     <span class="hero-num" style="color:${heroColor}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
     <span class="hsub">SOL ${netPos ? "accumulated" : "distributed"}</span>
   </div>
   ${totals.netUsd ? `<div class="herousd">≈ ${netPos ? "+" : "-"}$${fmtUsd(Math.abs(totals.netUsd))} USD</div>` : ""}
-  <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="24h cumulative net whale flow"></canvas></div>
+  <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="${WINDOW_LABELS[window]} cumulative net whale flow"></canvas></div>
 </div>
 
 <div class="cards">

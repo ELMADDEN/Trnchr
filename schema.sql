@@ -30,3 +30,17 @@ CREATE TABLE IF NOT EXISTS token_meta (
   name       TEXT,                   -- e.g. 'Bonk'
   updated_at INTEGER NOT NULL        -- unix timestamp of last refresh
 );
+
+-- Short-lived cache of live market stats from DexScreener (price, market
+-- cap, liquidity, volume), so a busy dashboard doesn't hammer the API.
+CREATE TABLE IF NOT EXISTS market_cache (
+  mint             TEXT PRIMARY KEY, -- token contract address (CA)
+  price_usd        REAL,
+  price_change_24h REAL,             -- percent, e.g. 12.4 means +12.4%
+  liquidity_usd    REAL,
+  market_cap       REAL,
+  volume_1h        REAL,
+  volume_6h        REAL,
+  volume_24h       REAL,
+  updated_at       INTEGER NOT NULL  -- unix timestamp of last refresh
+);
