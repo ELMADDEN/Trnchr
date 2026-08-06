@@ -13,7 +13,17 @@
  *   WEBHOOK_SECRET      required — any password you invent; must match the ?key= in your Helius webhook URL
  *   MIN_TRADE_SOL       optional — minimum trade size in SOL to record (default 25)
  *   ANTHROPIC_API_KEY   optional — enables the AI analyst
+ *
+ * USD pricing and token symbols come from Jupiter's free public API
+ * (lite-api.jup.ag — no key or signup needed). Both are best-effort: if
+ * Jupiter is unreachable, trades still record with usd_amount = NULL and
+ * the dashboard falls back to showing the raw mint address.
  */
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+const JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3";
+const JUPITER_TOKEN_URL = "https://lite-api.jup.ag/tokens/v2/search";
+const TOKEN_META_TTL = 7 * 86400; // refresh cached symbols weekly
 
 export default {
   // ---------------------------------------------------------------- HTTP ----
@@ -57,27 +67,121 @@ async function handleWebhook(request, url, env) {
   const txs = Array.isArray(payload) ? payload : [payload];
   const minSol = parseFloat(env.MIN_TRADE_SOL || "25");
   const now = Math.floor(Date.now() / 1000);
-  let stored = 0;
 
+  const whales = [];
   for (const tx of txs) {
     const t = parseSwap(tx);
     if (!t) continue;                 // not a swap we understand
     if (t.sol_amount < minSol) continue; // too small — not a whale
+    whales.push(t);
+  }
 
-    try {
-      await env.DB.prepare(
-        `INSERT OR IGNORE INTO trades
-         (signature, ts, wallet, mint, side, sol_amount, received_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`
-      )
-        .bind(t.signature, t.ts, t.wallet, t.mint, t.side, t.sol_amount, now)
-        .run();
-      stored++;
-    } catch (e) {
-      console.log("insert error", e.message);
+  let stored = 0;
+  if (whales.length) {
+    const [solPrice] = await Promise.all([
+      getSolPriceUsd(),
+      resolveTokenMeta(env, whales.map((t) => t.mint)), // warms token_meta for the dashboard
+    ]);
+
+    for (const t of whales) {
+      const usdAmount = solPrice != null ? t.sol_amount * solPrice : null;
+      try {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO trades
+           (signature, ts, wallet, mint, side, sol_amount, usd_amount, received_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+          .bind(t.signature, t.ts, t.wallet, t.mint, t.side, t.sol_amount, usdAmount, now)
+          .run();
+        stored++;
+      } catch (e) {
+        console.log("insert error", e.message);
+      }
     }
   }
   return json({ ok: true, received: txs.length, stored });
+}
+
+// ============================================================ JUPITER ======
+
+/** Current SOL/USD price via Jupiter's Price API, or null if unavailable. */
+async function getSolPriceUsd() {
+  try {
+    const res = await fetch(`${JUPITER_PRICE_URL}?ids=${SOL_MINT}`, {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const price = data?.[SOL_MINT]?.usdPrice;
+    return typeof price === "number" ? price : null;
+  } catch (e) {
+    console.log("jupiter price error", e.message);
+    return null;
+  }
+}
+
+/**
+ * Resolve mint addresses to {symbol, name} via a local D1 cache backed by
+ * Jupiter's Token API. Returns a map keyed by mint; entries are omitted
+ * when neither the cache nor Jupiter has data for that mint.
+ */
+async function resolveTokenMeta(env, mints) {
+  const unique = [...new Set(mints)];
+  if (!unique.length) return {};
+
+  const now = Math.floor(Date.now() / 1000);
+  const placeholders = unique.map(() => "?").join(",");
+  const cached = await env.DB.prepare(
+    `SELECT mint, symbol, name, updated_at FROM token_meta WHERE mint IN (${placeholders})`
+  )
+    .bind(...unique)
+    .all();
+
+  const cachedByMint = {};
+  (cached.results || []).forEach((r) => (cachedByMint[r.mint] = r));
+
+  const meta = {};
+  const stale = [];
+  for (const mint of unique) {
+    const c = cachedByMint[mint];
+    if (c && now - c.updated_at < TOKEN_META_TTL) {
+      meta[mint] = { symbol: c.symbol, name: c.name };
+    } else {
+      stale.push(mint);
+    }
+  }
+
+  if (stale.length) {
+    try {
+      const res = await fetch(`${JUPITER_TOKEN_URL}?query=${stale.join(",")}`, {
+        signal: AbortSignal.timeout(4000),
+      });
+      if (res.ok) {
+        const list = await res.json();
+        for (const tok of Array.isArray(list) ? list : []) {
+          if (!tok?.id) continue;
+          meta[tok.id] = { symbol: tok.symbol || null, name: tok.name || null };
+          await env.DB.prepare(
+            `INSERT INTO token_meta (mint, symbol, name, updated_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT(mint) DO UPDATE SET symbol=excluded.symbol, name=excluded.name, updated_at=excluded.updated_at`
+          )
+            .bind(tok.id, tok.symbol || null, tok.name || null, now)
+            .run();
+        }
+      }
+    } catch (e) {
+      console.log("jupiter token meta error", e.message);
+    }
+    // Jupiter may not return every requested mint (unlisted/new tokens) —
+    // fall back to whatever we had cached for those, even if stale.
+    for (const mint of stale) {
+      if (!meta[mint] && cachedByMint[mint]) {
+        meta[mint] = { symbol: cachedByMint[mint].symbol, name: cachedByMint[mint].name };
+      }
+    }
+  }
+
+  return meta;
 }
 
 /** Turn a Helius "enhanced" transaction into {signature, ts, wallet, mint, side, sol_amount} or null. */
@@ -118,19 +222,25 @@ async function getFlows(env) {
   const dayAgo = Math.floor(Date.now() / 1000) - 86400;
 
   const flows = await env.DB.prepare(
-    `SELECT mint,
+    `SELECT t.mint, tm.symbol AS symbol,
             SUM(CASE WHEN side='BUY'  THEN sol_amount ELSE 0 END) AS buy_sol,
             SUM(CASE WHEN side='SELL' THEN sol_amount ELSE 0 END) AS sell_sol,
+            SUM(CASE WHEN side='BUY'  THEN usd_amount ELSE 0 END) AS buy_usd,
+            SUM(CASE WHEN side='SELL' THEN usd_amount ELSE 0 END) AS sell_usd,
             COUNT(*)                       AS trades,
             COUNT(DISTINCT wallet)         AS whales
-     FROM trades WHERE ts >= ?
-     GROUP BY mint
+     FROM trades t
+     LEFT JOIN token_meta tm ON tm.mint = t.mint
+     WHERE ts >= ?
+     GROUP BY t.mint
      ORDER BY (buy_sol - sell_sol) DESC`
   ).bind(dayAgo).all();
 
   const recent = await env.DB.prepare(
-    `SELECT ts, wallet, mint, side, sol_amount
-     FROM trades ORDER BY ts DESC LIMIT 30`
+    `SELECT t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount
+     FROM trades t
+     LEFT JOIN token_meta tm ON tm.mint = t.mint
+     ORDER BY t.ts DESC LIMIT 30`
   ).all();
 
   const verdict = await env.DB.prepare(
@@ -149,12 +259,13 @@ async function getFlows(env) {
     ? flows.results.reduce(
         (a, f) => ({
           net: a.net + (f.buy_sol - f.sell_sol),
+          netUsd: a.netUsd + ((f.buy_usd || 0) - (f.sell_usd || 0)),
           whales: a.whales + f.whales,
           trades: a.trades + f.trades,
         }),
-        { net: 0, whales: 0, trades: 0 }
+        { net: 0, netUsd: 0, whales: 0, trades: 0 }
       )
-    : { net: 0, whales: 0, trades: 0 };
+    : { net: 0, netUsd: 0, whales: 0, trades: 0 };
 
   return {
     flows: flows.results || [],
@@ -171,11 +282,16 @@ async function runAnalyst(env) {
   const { flows } = await getFlows(env);
   if (!flows.length) return;
 
-  const lines = flows.map(
-    (f) =>
-      `${f.mint}: buys ${f.buy_sol.toFixed(1)} SOL, sells ${f.sell_sol.toFixed(1)} SOL, ` +
+  const lines = flows.map((f) => {
+    const usdNote =
+      f.buy_usd || f.sell_usd
+        ? ` (≈$${fmtUsd(f.buy_usd)} bought / $${fmtUsd(f.sell_usd)} sold)`
+        : "";
+    return (
+      `${tokenLabel(f)}: buys ${f.buy_sol.toFixed(1)} SOL, sells ${f.sell_sol.toFixed(1)} SOL${usdNote}, ` +
       `net ${(f.buy_sol - f.sell_sol).toFixed(1)} SOL across ${f.trades} trades by ${f.whales} unique whales`
-  );
+    );
+  });
 
   let summary = "Computed summary (no AI key set):\n" + lines.join("\n");
 
@@ -238,8 +354,11 @@ async function dashboard(env) {
   const netPos = totals.net >= 0;
   const heroColor = netPos ? "#12b886" : "#ff5a4d";
 
-  let buySol = 0, sellSol = 0;
-  flows.forEach((f) => { buySol += f.buy_sol; sellSol += f.sell_sol; });
+  let buySol = 0, sellSol = 0, buyUsd = 0, sellUsd = 0;
+  flows.forEach((f) => {
+    buySol += f.buy_sol; sellSol += f.sell_sol;
+    buyUsd += f.buy_usd || 0; sellUsd += f.sell_usd || 0;
+  });
 
   // 24h cumulative-net series for the dot pulse
   const nowHr = Math.floor(Date.now() / 3600000);
@@ -255,17 +374,21 @@ async function dashboard(env) {
   const flowRows = flows
     .map((f, i) => {
       const net = f.buy_sol - f.sell_sol;
+      const netUsd = (f.buy_usd || 0) - (f.sell_usd || 0);
       const pos = net >= 0;
       const sw = (f.sell_sol / maxFlow) * 50;
       const bw = (f.buy_sol / maxFlow) * 50;
       return `<div class="frow"${i === 0 ? ' style="border-top:none"' : ""}>
-        <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">$${short(f.mint)}</a>
+        <a class="sym" href="https://gmgn.ai/sol/token/${f.mint}" target="_blank">${escapeHtml(tokenLabel(f))}</a>
         <span class="axis">
           <span class="lft"><span class="sell" style="width:${sw}%"></span></span>
           <span class="cen"></span>
           <span class="rgt"><span class="buy" style="width:${bw}%"></span></span>
         </span>
-        <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)}</span>
+        <span class="netcol">
+          <span class="net ${pos ? "pos" : "neg"}">${pos ? "+" : ""}${net.toFixed(1)}</span>
+          ${netUsd ? `<span class="netusd">${netUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(netUsd))}</span>` : ""}
+        </span>
       </div>`;
     })
     .join("");
@@ -278,8 +401,8 @@ async function dashboard(env) {
       return `<div class="trow"${i === 0 ? ' style="border-top:none"' : ""}>
         <span class="tm">${hm}</span>
         <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
-        <span class="tsol">${r.sol_amount.toFixed(1)} SOL</span>
-        <span class="tsym">$${short(r.mint)}</span>
+        <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
+        <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
         <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}</a>
       </div>`;
     })
@@ -304,6 +427,7 @@ async function dashboard(env) {
   .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
   .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
   .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
+  .herousd{font-size:13px;color:#6b6b70;margin-top:2px}
   .pulsewrap{position:relative;height:80px;margin:6px -6px -2px}
   .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
   .card{background:var(--card);border-radius:14px;padding:14px 16px}
@@ -312,20 +436,23 @@ async function dashboard(env) {
   .csub{font-size:11px;color:var(--mut);margin-top:2px}
   .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
-  .frow{display:grid;grid-template-columns:110px 1fr 74px;align-items:center;gap:12px;padding:9px 0;border-top:0.5px solid var(--line)}
+  .frow{display:grid;grid-template-columns:110px 1fr 84px;align-items:center;gap:12px;padding:9px 0;border-top:0.5px solid var(--line)}
   .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none}
   .axis{display:flex;align-items:center;height:14px}
   .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
   .cen{width:1px;height:16px;background:#e0e0e4}
   .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
   .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
+  .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25}
   .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+  .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums}
   .pos{color:var(--teal)}.neg{color:var(--coral)}
   .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
-  .trow{display:grid;grid-template-columns:46px 42px 74px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
   .tm{color:var(--mut);font-variant-numeric:tabular-nums}
   .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+  .tusd{font-weight:400;color:var(--mut);font-size:10px}
   .tsym{color:var(--mut);padding-left:8px}
   .tw{text-align:right;color:var(--mut2);text-decoration:none}
   .empty{color:var(--mut);padding:10px 0;font-size:13px}
@@ -341,13 +468,14 @@ async function dashboard(env) {
     <span class="hero-num" style="color:${heroColor}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
     <span class="hsub">SOL ${netPos ? "accumulated" : "distributed"}</span>
   </div>
+  ${totals.netUsd ? `<div class="herousd">≈ ${netPos ? "+" : "-"}$${fmtUsd(Math.abs(totals.netUsd))} USD</div>` : ""}
   <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="24h cumulative net whale flow"></canvas></div>
 </div>
 
 <div class="cards">
   <div class="card"><div class="clab">Whales</div><div class="cnum">${totals.whales}</div><div class="csub">${totals.trades} trades</div></div>
-  <div class="card"><div class="clab">Buys</div><div class="cnum pos">${flows.filter(f=>f.buy_sol>0).length}</div><div class="csub">${Math.round(buySol)} SOL in</div></div>
-  <div class="card"><div class="clab">Sells</div><div class="cnum neg">${flows.filter(f=>f.sell_sol>0).length}</div><div class="csub">${Math.round(sellSol)} SOL out</div></div>
+  <div class="card"><div class="clab">Buys</div><div class="cnum pos">${flows.filter(f=>f.buy_sol>0).length}</div><div class="csub">${Math.round(buySol)} SOL${buyUsd ? " · $" + fmtUsd(buyUsd) : ""}</div></div>
+  <div class="card"><div class="clab">Sells</div><div class="cnum neg">${flows.filter(f=>f.sell_sol>0).length}</div><div class="csub">${Math.round(sellSol)} SOL${sellUsd ? " · $" + fmtUsd(sellUsd) : ""}</div></div>
 </div>
 
 <div class="panel">
@@ -398,3 +526,15 @@ setTimeout(function(){location.reload();},60000);
 const short = (s) => (s && s.length > 12 ? s.slice(0, 4) + "…" + s.slice(-4) : s || "");
 const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
 const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+/** "$BONK" if we have a Jupiter symbol for this row's mint, else a shortened mint address. */
+const tokenLabel = (row) => "$" + (row.symbol || short(row.mint));
+
+/** Compact USD figure: 1.2M, 4.5k, or a plain integer. */
+function fmtUsd(n) {
+  if (n == null) return "0";
+  const abs = Math.abs(n);
+  if (abs >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (abs >= 1e3) return (n / 1e3).toFixed(1) + "k";
+  return n.toFixed(0);
+}

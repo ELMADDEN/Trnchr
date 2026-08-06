@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS trades (
   mint        TEXT NOT NULL,         -- token contract address (CA)
   side        TEXT NOT NULL,         -- 'BUY' or 'SELL'
   sol_amount  REAL NOT NULL,         -- trade size in SOL
+  usd_amount  REAL,                  -- trade size in USD at trade time (via Jupiter Price API), NULL if the lookup failed
   received_at INTEGER NOT NULL       -- when the webhook arrived
 );
 
@@ -19,4 +20,13 @@ CREATE TABLE IF NOT EXISTS verdicts (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   created_at INTEGER NOT NULL,
   summary    TEXT NOT NULL           -- the analyst's write-up
+);
+
+-- Cache of mint -> symbol/name from Jupiter's Token API, so the dashboard
+-- doesn't need to call Jupiter on every page load.
+CREATE TABLE IF NOT EXISTS token_meta (
+  mint       TEXT PRIMARY KEY,       -- token contract address (CA)
+  symbol     TEXT,                   -- e.g. 'BONK'
+  name       TEXT,                   -- e.g. 'Bonk'
+  updated_at INTEGER NOT NULL        -- unix timestamp of last refresh
 );

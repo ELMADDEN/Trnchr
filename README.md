@@ -6,13 +6,13 @@ A tiny agent pipeline that **accumulates Solana whale flows while you sleep**, r
 Helius (watches the chain, free tier)
    │  pushes every swap on your watchlist tokens
    ▼
-Cloudflare Worker  /webhook     ← the COLLECTOR: keeps trades ≥ 25 SOL
-   ▼
+Cloudflare Worker  /webhook     ← the COLLECTOR: keeps trades ≥ 25 SOL, prices them in USD
+   ▼                              and resolves symbols via Jupiter (free, no key)
 Cloudflare D1 database          ← the MEMORY: every whale trade, forever
    ▼
 Cron every 6 hours              ← the ANALYST: Claude summarises accumulation vs distribution
    ▼
-Your worker URL                 ← the DASHBOARD: net flows, bars, verdicts
+Your worker URL                 ← the DASHBOARD: net flows in SOL & USD, bars, verdicts
 ```
 
 Your **watchlist lives in Helius**, not in code — add or remove a token by editing the webhook in the Helius dashboard. No redeploys.
@@ -39,6 +39,17 @@ Your **watchlist lives in Helius**, not in code — add or remove a token by edi
 3. Go back to your GitHub repo → open `wrangler.toml` → click the **pencil icon** → replace `REPLACE_ME_WITH_YOUR_DATABASE_ID` with the ID you copied → **Commit changes**. Cloudflare redeploys automatically (watch it under your worker → Deployments).
 4. Back in Cloudflare → your D1 database → **Console** tab → paste the entire contents of `schema.sql` → **Execute**.
 
+> **Already have a whale-radar database from before USD pricing?** Run this once in the same D1 console instead of the full `schema.sql` (it only adds what's new, existing trades are untouched):
+> ```sql
+> ALTER TABLE trades ADD COLUMN usd_amount REAL;
+> CREATE TABLE IF NOT EXISTS token_meta (
+>   mint       TEXT PRIMARY KEY,
+>   symbol     TEXT,
+>   name       TEXT,
+>   updated_at INTEGER NOT NULL
+> );
+> ```
+
 ### Step 4 — Set your settings
 Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Variables and Secrets** → add:
 
@@ -49,6 +60,8 @@ Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Vari
 | `ANTHROPIC_API_KEY` | *(optional)* an API key from console.anthropic.com — turns on the AI analyst |
 
 Click Deploy/Save after adding them.
+
+USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag) — no key, signup, or extra setting needed.
 
 ### Step 5 — Point Helius at it
 1. Sign up free at helius.dev → dashboard → **Webhooks** → **New Webhook**.
@@ -76,11 +89,13 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 
 - Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — far more than this needs.
 - Helius free tier: enough webhook capacity for a small watchlist.
+- Jupiter Price/Token API: free tier, no key required.
 - Claude API analyst: optional; 4 short calls/day ≈ a few cents.
 
 ## Honest limitations (v1)
 
-- Trade sizes are measured in **SOL, not USD** (no price feed dependency; ~simple and reliable).
+- USD values are the SOL price *at the moment the trade was recorded*, from Jupiter — if Jupiter is briefly unreachable, that trade's USD figure is left blank (SOL figure is always exact, since it comes straight off-chain).
+- Token symbols come from Jupiter's token list; very new or unlisted tokens may still show as a shortened contract address until Jupiter indexes them.
 - Very early **pump.fun bonding-curve** trades don't always parse as clean swaps; tokens that have migrated (Raydium/PumpSwap) work best.
 - "Whale" = trade size only. Labeling *which* wallets are smart money is Phase 2 — the wallet links on the dashboard are how you start building that list manually.
 
