@@ -27,6 +27,9 @@
  *   HELIUS_API_KEY      optional — enables wallet-funding lookups, which cluster whale activity split across multiple wallets funded by the same source
  *   FUNDING_MAX_HOPS    optional — how many funding edges to trace back per wallet (default 2: wallet -> funder -> funder's funder); only matters with HELIUS_API_KEY set
  *   FUNDING_HUB_FANOUT  optional — an address that has funded more than this many distinct wallets is treated as a hub (CEX/router), never clustered through (default 3)
+ *   HELIUS_WEBHOOK_ID   optional — your Helius webhook's ID (from its dashboard page, NOT the webhook secret). Setting this turns on auto-tracking: every 2h, the Worker fetches trending Solana tokens from DexScreener and rewrites your Helius webhook's watched addresses to match. Manual edits to the watchlist in the Helius dashboard will be overwritten on the next sync — see PINNED_TOKENS to keep specific tokens always-watched.
+ *   AUTO_TRACK_TOP_N    optional — how many trending tokens to auto-track (default 10)
+ *   PINNED_TOKENS       optional — comma-separated mint addresses always kept in the watchlist alongside the trending ones
  *
  * USD pricing and token symbols come from Jupiter's free public API
  * (lite-api.jup.ag — no key or signup needed). Live market stats (price
@@ -45,13 +48,19 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3";
 const JUPITER_TOKEN_URL = "https://lite-api.jup.ag/tokens/v2/search";
 const DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana";
+const DEXSCREENER_TRENDING_URL = "https://api.dexscreener.com/metas/trending/v1";
 const HELIUS_API_URL = "https://api.helius.xyz/v0/addresses";
+const HELIUS_WEBHOOK_URL = "https://api.helius.xyz/v0/webhooks";
 const TOKEN_META_TTL = 7 * 86400;      // refresh cached symbols weekly
 const MARKET_CACHE_TTL = 90;           // refresh cached market stats every 90s
 const FUNDING_CACHE_TTL = 14 * 86400;  // recheck a wallet's funding source every 2 weeks
 const MIN_TRANSFER_LAMPORTS = 0.05 * 1e9; // ignore dust/fee-relay transfers when looking for a funder
 const DEFAULT_FUNDING_MAX_HOPS = 2;  // wallet -> funder -> funder's funder
 const DEFAULT_HUB_FANOUT_CAP = 3;    // an address funding more than this many distinct wallets is a hub (CEX/router), not a personal funder
+const DEFAULT_AUTO_TRACK_TOP_N = 10;
+const MAX_WATCHLIST_SIZE = 50;       // defensive cap regardless of config, independent of any Helius-side limit
+const ANALYST_CRON = "0 */6 * * *";
+const TRENDING_SYNC_CRON = "0 */2 * * *";
 
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
@@ -79,7 +88,11 @@ export default {
 
   // ---------------------------------------------------------------- CRON ----
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runAnalyst(env));
+    if (event.cron === TRENDING_SYNC_CRON) {
+      ctx.waitUntil(syncTrendingWatchlist(env));
+    } else {
+      ctx.waitUntil(runAnalyst(env));
+    }
   },
 };
 
@@ -430,6 +443,106 @@ async function getMarketData(env, mints) {
   }
 
   return market;
+}
+
+// ============================================================ TRENDING =====
+
+/**
+ * Best-effort: fetch up to `limit` Solana token mints from DexScreener's
+ * trending endpoint. The exact response shape isn't fully documented for
+ * third-party use, so this parses defensively — several possible wrapper
+ * keys and several possible per-item address fields — and returns an empty
+ * list rather than throwing if the shape doesn't match what's expected.
+ */
+async function fetchTrendingMints(limit) {
+  try {
+    const res = await fetch(`${DEXSCREENER_TRENDING_URL}?chainId=solana`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const list = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.pairs)
+      ? data.pairs
+      : Array.isArray(data?.tokens)
+      ? data.tokens
+      : Array.isArray(data?.data)
+      ? data.data
+      : [];
+
+    const mints = [];
+    for (const item of list) {
+      const mint = item?.tokenAddress || item?.address || item?.baseToken?.address || item?.mint;
+      if (mint && !mints.includes(mint)) mints.push(mint);
+      if (mints.length >= limit) break;
+    }
+    return mints;
+  } catch (e) {
+    console.log("dexscreener trending fetch error", e.message);
+    return [];
+  }
+}
+
+/**
+ * Rewrites the Helius webhook's watched addresses to [PINNED_TOKENS,
+ * ...top trending]. No-ops entirely unless HELIUS_API_KEY and
+ * HELIUS_WEBHOOK_ID are both set. Fetches the webhook's current full
+ * config first and PUTs it back with only accountAddresses changed, so
+ * every other setting (transaction types, webhook type, auth header, …)
+ * configured in the Helius dashboard is preserved untouched. Skips the
+ * PUT entirely if the desired address set already matches — avoids
+ * needless API calls and log noise on every sync tick.
+ */
+async function syncTrendingWatchlist(env) {
+  if (!env.HELIUS_API_KEY || !env.HELIUS_WEBHOOK_ID) return;
+
+  const topN = Math.max(
+    1,
+    Math.min(MAX_WATCHLIST_SIZE, parseInt(env.AUTO_TRACK_TOP_N || String(DEFAULT_AUTO_TRACK_TOP_N), 10))
+  );
+  const trending = await fetchTrendingMints(topN);
+  if (!trending.length) {
+    console.log("trending sync: no trending tokens fetched, skipping this cycle");
+    return;
+  }
+
+  const pinned = (env.PINNED_TOKENS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const desired = [...new Set([...pinned, ...trending])].slice(0, MAX_WATCHLIST_SIZE);
+
+  try {
+    const getRes = await fetch(`${HELIUS_WEBHOOK_URL}/${env.HELIUS_WEBHOOK_ID}?api-key=${env.HELIUS_API_KEY}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!getRes.ok) {
+      console.log("trending sync: failed to fetch current webhook config", getRes.status);
+      return;
+    }
+    const current = await getRes.json();
+    const currentAddresses = Array.isArray(current.accountAddresses) ? current.accountAddresses : [];
+
+    const unchanged =
+      currentAddresses.length === desired.length && currentAddresses.every((a) => desired.includes(a));
+    if (unchanged) return;
+
+    const putRes = await fetch(`${HELIUS_WEBHOOK_URL}/${env.HELIUS_WEBHOOK_ID}?api-key=${env.HELIUS_API_KEY}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...current, accountAddresses: desired }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!putRes.ok) {
+      console.log("trending sync: failed to update webhook", putRes.status, await putRes.text());
+      return;
+    }
+    console.log(`trending sync: watchlist updated to ${desired.length} addresses`);
+  } catch (e) {
+    console.log("trending sync error", e.message);
+  }
 }
 
 /** Turn a Helius "enhanced" transaction into {signature, ts, wallet, mint, side, sol_amount} or null. */

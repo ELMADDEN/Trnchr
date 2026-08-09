@@ -3,6 +3,8 @@
 A tiny agent pipeline that **accumulates Solana whale flows while you sleep**, running entirely on free tiers, set up entirely from a browser. No terminal, ever.
 
 ```
+Cron every 2 hours (optional)   ← the SCOUT: fetches trending Solana tokens from DexScreener,
+   ▼                              rewrites your Helius webhook's watchlist to match (+ any pinned)
 Helius (watches the chain, free tier)
    │  pushes every swap on your watchlist tokens
    ▼
@@ -20,7 +22,7 @@ Your worker URL                 ← the DASHBOARD: ranked flows in SOL & USD, li
                                    1H/6H/24H/7D toggle
 ```
 
-Your **watchlist lives in Helius**, not in code — add or remove a token by editing the webhook in the Helius dashboard. No redeploys.
+Your **watchlist lives in Helius**, not in code — by default, add or remove a token by editing the webhook in the Helius dashboard, no redeploys. Optionally, set `HELIUS_WEBHOOK_ID` and the Worker takes over managing that list for you, keeping it synced to whatever's trending — see [How trending auto-track works](#how-trending-auto-track-works).
 
 ---
 
@@ -89,6 +91,9 @@ Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Vari
 | `HELIUS_API_KEY` | *(optional)* an API key from your Helius dashboard (Settings → API Keys — different from the webhook secret) — turns on wallet-funding lookups, which cluster whale activity split across multiple wallets |
 | `FUNDING_MAX_HOPS` | *(optional, default `2`)* how many funding edges to trace back per wallet — `2` means wallet → funder → funder's funder; only matters with `HELIUS_API_KEY` set |
 | `FUNDING_HUB_FANOUT` | *(optional, default `3`)* an address that's funded more than this many distinct wallets is treated as a shared hub (CEX/router) and the chain stops there instead of clustering through it |
+| `HELIUS_WEBHOOK_ID` | *(optional)* your Helius webhook's ID (from its dashboard page — different from both the webhook secret and `HELIUS_API_KEY`) — turns on trending auto-track, see below |
+| `AUTO_TRACK_TOP_N` | *(optional, default `10`)* how many trending tokens to auto-track; only matters with `HELIUS_WEBHOOK_ID` set |
+| `PINNED_TOKENS` | *(optional)* comma-separated mint addresses always kept in the watchlist alongside the auto-tracked trending ones |
 
 Click Deploy/Save after adding them.
 
@@ -100,6 +105,14 @@ Filtering by single-trade size is trivial to bypass — split one 100 SOL buy in
 
 Without `HELIUS_API_KEY`, an actor is just its own wallet (still fixes the split-*transaction* case). With it, each wallet's funding chain is traced back up to `FUNDING_MAX_HOPS` edges (wallet → funder → funder's funder by default) and wallets that land on the same chain root are merged into one actor — catching a whale that spreads buys across several wallets, even if those wallets were funded through an extra hop rather than directly. The chain stops early at any address that's already funded more than `FUNDING_HUB_FANOUT` distinct wallets, since that's almost certainly a shared exchange or router, not a personal funding wallet — without that guard, tracing far enough back would eventually converge on some CEX withdrawal address and falsely merge dozens of unrelated whales into one. Detected clusters are surfaced in the **Wallet clusters** panel.
 
+### How trending auto-track works
+
+By default your watchlist is whatever you typed into the Helius webhook, and it stays that way until you edit it again. Set `HELIUS_WEBHOOK_ID` and that changes: every 2 hours, the Worker fetches DexScreener's Solana trending list, takes the top `AUTO_TRACK_TOP_N`, adds anything in `PINNED_TOKENS`, and — only if the resulting list actually differs from what's currently watched — calls Helius's webhook API to replace `accountAddresses` with it. Everything else about your webhook (secret, transaction types, webhook type) is read back and preserved untouched; only the address list changes.
+
+**This means manual edits to the watchlist in the Helius dashboard get silently overwritten on the next sync** once this is enabled — if there's a token you always want tracked regardless of trending status, put it in `PINNED_TOKENS` instead of adding it by hand in Helius.
+
+Honest caveat: DexScreener doesn't publish a fully documented, guaranteed-stable API for "trending" the way it does for its price/pair endpoints — this uses the best available endpoint, parsed defensively so a shape change or outage just skips that sync cycle (logged, not fatal) rather than breaking anything. If your watchlist never seems to update after setting `HELIUS_WEBHOOK_ID`, check your Worker's logs (Cloudflare dashboard → your worker → Logs) for `trending sync:` lines.
+
 ### Step 5 — Point Helius at it
 1. Sign up free at helius.dev → dashboard → **Webhooks** → **New Webhook**.
 2. Webhook URL:
@@ -108,7 +121,7 @@ Without `HELIUS_API_KEY`, an actor is just its own wallet (still fixes the split
 3. Webhook Type: **Enhanced**
 4. Transaction Types: **SWAP**
 5. Account Addresses: paste the token CAs you want to watch — this is your watchlist. Start with 1–3 tokens, e.g. `Ai66LHZG9MCzg1WKdawwqduVAXpNDUuV8M3uyq5ppump`
-6. Save.
+6. Save. If you want trending auto-track (above), open the saved webhook again and copy its **Webhook ID** shown on that page into `HELIUS_WEBHOOK_ID` in Step 4's settings — until you do, the watchlist stays exactly what you typed here.
 
 ### Step 6 — Watch it fill up
 Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first trade that pushes a wallet's cumulative volume on a watched token past your `MIN_TRADE_SOL`, rows appear. The first analyst verdict lands on the next 6-hour mark.
@@ -121,7 +134,7 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 - **Timeframe**: click **1H / 6H / 24H / 7D** at the top of the dashboard, or append `?window=6h` (also `1h`, `24h`, `7d`) to the URL — every number on the page recalculates for that window.
 - **Whale dominance**: the thin bar under each token shows whale-sized volume (your DB) as a % of that token's total DEX volume (DexScreener) for the selected window — a rough conviction signal, high = whales are most of the action, low = whale trades are a drop in a much bigger bucket.
 - **Wallet clusters**: when `HELIUS_API_KEY` is set, a panel lists actors whose whale-qualifying volume came from more than one wallet sharing a funding source — a small amber "N clustered" badge also appears next to any token with clustered whales, and a dot marks clustered wallets in the recent-trades list.
-- **Change watchlist**: Helius dashboard → edit webhook → add/remove CAs.
+- **Change watchlist**: Helius dashboard → edit webhook → add/remove CAs — unless `HELIUS_WEBHOOK_ID` is set, in which case it's auto-managed from trending tokens every 2h (edit `PINNED_TOKENS` instead for anything you want always-watched).
 - **Change whale threshold**: Cloudflare → worker → Settings → `MIN_TRADE_SOL` (cumulative per actor, not per trade — see [How whale detection works](#how-whale-detection-works)).
 - **Raw data**: `/api/flows` (optionally `?window=`) returns everything as JSON — paste it into a Claude chat for deeper analysis.
 
@@ -129,7 +142,7 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 
 - Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — should still be plenty for a small watchlist, but note that storing every trade above `DUST_FLOOR_SOL` (instead of only trades already past the whale threshold) means noticeably more D1 writes than earlier versions on an active token. Raise `DUST_FLOOR_SOL` if you're worried about volume.
 - Helius free tier: enough webhook capacity for a small watchlist; the optional funding-source lookup uses Helius's Enhanced Transactions API, called once per newly-seen address (wallet, then its funder, then its funder's funder, up to `FUNDING_MAX_HOPS`) and cached for 2 weeks — a deeper `FUNDING_MAX_HOPS` means more calls per new wallet, bounded by the hub cap kicking in once a chain hits shared infrastructure.
-- Jupiter Price/Token API and DexScreener API: both free tier, no key required.
+- Jupiter Price/Token API and DexScreener API: both free tier, no key required. Trending auto-track (if enabled) adds one more DexScreener call every 2 hours, plus one or two Helius webhook-management API calls only when the watchlist actually changes.
 - Claude API analyst: optional; 4 short calls/day ≈ a few cents.
 
 ## Honest limitations (v1)
@@ -140,9 +153,11 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 - Very early **pump.fun bonding-curve** trades don't always parse as clean swaps; tokens that have migrated (Raydium/PumpSwap) work best.
 - Wallet-funding clustering looks at each wallet's most recent handful of transfers and walks a bounded number of hops (`FUNDING_MAX_HOPS`), not an exhaustive forensic graph — it catches same-source sybil wallets a few hops deep, not a determined actor who routes through more hops than that or funds each wallet from a fresh CEX withdrawal. It can also mislabel a DEX/router address as the "funder" if that's genuinely the most recent SOL inflow (e.g. proceeds from an earlier sell) — the hub-fanout cap (`FUNDING_HUB_FANOUT`) catches this once an address has funded enough *distinct* wallets in your own data, but a hub's first appearance can still slip through once. Treat clusters as a strong hint, not proof.
 - "Whale" = size (now cumulative per actor, not per trade). Scoring *which* wallets are historically good traders (a true smart-money/PnL score) is still future work — the wallet links on the dashboard are how you start building that list manually.
+- Trending auto-track mirrors DexScreener's trending signal (volume/activity-based), not any particular site's specific "hot" ranking — it'll pick up broadly similar tokens to e.g. GMGN's Hot Searches, but won't match that list exactly since it's a different underlying metric. See the honest caveat about endpoint stability in [How trending auto-track works](#how-trending-auto-track-works).
 
 ## Troubleshooting
 
 - Dashboard says "Database not ready" → Step 3 wasn't finished (ID in wrangler.toml, schema executed).
 - Nothing appears → Helius webhook URL must contain `?key=` with your exact secret; check the webhook's delivery logs in Helius.
 - Analyst section empty → it only runs at 00:00/06:00/12:00/18:00 UTC, and only if there's data.
+- Watchlist never changes after setting `HELIUS_WEBHOOK_ID` → check `HELIUS_API_KEY` is also set (both are required), confirm the Webhook ID matches the one shown on your webhook's page in the Helius dashboard, and check Worker logs for `trending sync:` lines to see what's actually happening.
