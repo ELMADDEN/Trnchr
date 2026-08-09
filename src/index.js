@@ -24,7 +24,9 @@
  *   MIN_TRADE_SOL       optional — cumulative SOL an actor must move (buys+sells) within the selected window to count as a whale (default 25)
  *   DUST_FLOOR_SOL      optional — minimum SINGLE trade size to even bother storing (default 1); lower = catches finer-grained splitting, costs more D1 writes
  *   ANTHROPIC_API_KEY   optional — enables the AI analyst
- *   HELIUS_API_KEY       optional — enables wallet-funding lookups, which cluster whale activity split across multiple wallets funded by the same source
+ *   HELIUS_API_KEY      optional — enables wallet-funding lookups, which cluster whale activity split across multiple wallets funded by the same source
+ *   FUNDING_MAX_HOPS    optional — how many funding edges to trace back per wallet (default 2: wallet -> funder -> funder's funder); only matters with HELIUS_API_KEY set
+ *   FUNDING_HUB_FANOUT  optional — an address that has funded more than this many distinct wallets is treated as a hub (CEX/router), never clustered through (default 3)
  *
  * USD pricing and token symbols come from Jupiter's free public API
  * (lite-api.jup.ag — no key or signup needed). Live market stats (price
@@ -48,6 +50,8 @@ const TOKEN_META_TTL = 7 * 86400;      // refresh cached symbols weekly
 const MARKET_CACHE_TTL = 90;           // refresh cached market stats every 90s
 const FUNDING_CACHE_TTL = 14 * 86400;  // recheck a wallet's funding source every 2 weeks
 const MIN_TRANSFER_LAMPORTS = 0.05 * 1e9; // ignore dust/fee-relay transfers when looking for a funder
+const DEFAULT_FUNDING_MAX_HOPS = 2;  // wallet -> funder -> funder's funder
+const DEFAULT_HUB_FANOUT_CAP = 3;    // an address funding more than this many distinct wallets is a hub (CEX/router), not a personal funder
 
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
@@ -228,8 +232,16 @@ async function resolveTokenMeta(env, mints) {
 /**
  * Best-effort: for each wallet, find the most recent external SOL transfer
  * INTO it (a heuristic "funder"), via Helius's Enhanced Transactions API,
- * and cache it in wallet_funding. Used to cluster whale activity that's
- * been split across several wallets funded from the same source.
+ * and cache it in wallet_funding. Then recurses onto the newly-discovered
+ * funder addresses themselves (funder's funder, etc.), up to FUNDING_MAX_HOPS
+ * total edges, so a whale that launders through an extra hop before
+ * splitting into trading wallets still clusters correctly.
+ *
+ * Addresses that already show high fan-out (many distinct wallets funded —
+ * see hubFanout) are never chased further: those are almost certainly a
+ * CEX/router/aggregator address, not a personal funding wallet, and chasing
+ * them would waste API calls and eventually merge unrelated whales who
+ * simply share an exchange.
  *
  * This is a heuristic, not a full recursive funding graph: it only looks
  * at each wallet's most recent handful of transfers, and it will pick up
@@ -238,8 +250,13 @@ async function resolveTokenMeta(env, mints) {
  * sybil-wallet structuring; not a substitute for real chain-forensics
  * tooling. No-ops entirely if HELIUS_API_KEY isn't set.
  */
-async function resolveFundingSource(env, wallets) {
+async function resolveFundingSource(env, wallets, hopsRemaining) {
   if (!env.HELIUS_API_KEY) return;
+  if (hopsRemaining == null) {
+    hopsRemaining = Math.max(1, parseInt(env.FUNDING_MAX_HOPS || String(DEFAULT_FUNDING_MAX_HOPS), 10));
+  }
+  if (hopsRemaining <= 0) return;
+
   const unique = [...new Set(wallets)];
   if (!unique.length) return;
 
@@ -261,6 +278,7 @@ async function resolveFundingSource(env, wallets) {
   (cached.results || []).forEach((r) => (checkedByWallet[r.wallet] = r.checked_at));
   const stale = unique.filter((w) => now - (checkedByWallet[w] || 0) >= FUNDING_CACHE_TTL);
 
+  const discoveredFunders = [];
   for (const wallet of stale) {
     try {
       const res = await fetch(
@@ -287,9 +305,37 @@ async function resolveFundingSource(env, wallets) {
       )
         .bind(wallet, fundedBy, now)
         .run();
+      if (fundedBy) discoveredFunders.push(fundedBy);
     } catch (e) {
       console.log("helius funding lookup error", e.message);
     }
+  }
+
+  if (discoveredFunders.length && hopsRemaining > 1) {
+    const chaseable = await filterOutHubs(env, discoveredFunders);
+    if (chaseable.length) await resolveFundingSource(env, chaseable, hopsRemaining - 1);
+  }
+}
+
+/** Drop addresses that already show hub-like fan-out (funded many distinct wallets) — not worth chasing further, and not safe to cluster through. */
+async function filterOutHubs(env, addresses) {
+  const cap = Math.max(1, parseInt(env.FUNDING_HUB_FANOUT || String(DEFAULT_HUB_FANOUT_CAP), 10));
+  const unique = [...new Set(addresses)];
+  if (!unique.length) return [];
+  try {
+    const placeholders = unique.map(() => "?").join(",");
+    const res = await env.DB.prepare(
+      `SELECT funded_by, COUNT(DISTINCT wallet) AS fanout
+       FROM wallet_funding WHERE funded_by IN (${placeholders}) GROUP BY funded_by`
+    )
+      .bind(...unique)
+      .all();
+    const fanoutByAddr = {};
+    (res.results || []).forEach((r) => (fanoutByAddr[r.funded_by] = r.fanout));
+    return unique.filter((a) => (fanoutByAddr[a] || 0) <= cap);
+  } catch (e) {
+    console.log("hub fanout check error", e.message);
+    return unique; // best-effort — still bounded by the hop count either way
   }
 }
 
@@ -425,12 +471,20 @@ function parseSwap(tx) {
  * qualifies actors whose cumulative volume clears MIN_TRADE_SOL as
  * whale_actors. Every query below joins through this so "whale" always
  * means cumulative-per-actor, never a single trade's size.
- * Placeholders: [windowStart, windowStart, minWhaleSol].
  *
- * Two variants: the funded one clusters wallets by known funding source
- * (wallet_funding); the unfunded one falls back to actor == wallet. Picked
- * per-call by whether wallet_funding exists yet, so an un-migrated database
- * still gets correct (if unclustered) whale detection instead of an error.
+ * Two variants, picked per-call by whether wallet_funding exists yet (so an
+ * un-migrated database still gets correct, if unclustered, whale detection
+ * instead of an error):
+ *
+ *   UNFUNDED — actor == wallet. Placeholders: [windowStart, windowStart, minWhaleSol].
+ *
+ *   FUNDED — actor == the wallet's funding-chain root, walked up to
+ *   FUNDING_MAX_HOPS edges via a recursive CTE. Any node whose fan-out
+ *   (COUNT DISTINCT wallets it has funded) exceeds FUNDING_HUB_FANOUT stops
+ *   the chain right there instead of being used as a clustering root — an
+ *   address that funded a dozen unrelated wallets is a CEX/router, not a
+ *   sybil operator, and clustering through it would merge unrelated whales.
+ *   Placeholders: [windowStart, maxHops, hubFanoutCap, windowStart, minWhaleSol].
  */
 const ACTOR_TOTALS_CTE = `
   actor_totals AS (
@@ -448,11 +502,31 @@ const ACTOR_TOTALS_CTE = `
   )
 `;
 const WHALE_CTE_FUNDED = `
-  WITH actor_map AS (
-    SELECT DISTINCT t.wallet, COALESCE(wf.funded_by, t.wallet) AS actor
+  WITH RECURSIVE
+  funder_fanout AS (
+    SELECT funded_by, COUNT(DISTINCT wallet) AS fanout
+    FROM wallet_funding
+    WHERE funded_by IS NOT NULL
+    GROUP BY funded_by
+  ),
+  chain(origin, node, hop) AS (
+    SELECT DISTINCT t.wallet, t.wallet, 0
     FROM trades t
-    LEFT JOIN wallet_funding wf ON wf.wallet = t.wallet
     WHERE t.ts >= ?
+    UNION ALL
+    SELECT chain.origin, wf.funded_by, chain.hop + 1
+    FROM chain
+    JOIN wallet_funding wf ON wf.wallet = chain.node
+    LEFT JOIN funder_fanout ff ON ff.funded_by = wf.funded_by
+    WHERE chain.hop < ?
+      AND wf.funded_by IS NOT NULL
+      AND wf.funded_by != chain.node
+      AND COALESCE(ff.fanout, 0) <= ?
+  ),
+  actor_map AS (
+    SELECT c.origin AS wallet, c.node AS actor
+    FROM chain c
+    WHERE c.hop = (SELECT MAX(hop) FROM chain c2 WHERE c2.origin = c.origin)
   ),
   ${ACTOR_TOTALS_CTE}
 `;
@@ -482,8 +556,17 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
   const windowStart = Math.floor(Date.now() / 1000) - windowSeconds;
   const bucketSeconds = Math.max(60, Math.floor(windowSeconds / 24)); // always ~24 buckets for the pulse chart
   const minWhaleSol = parseFloat(env.MIN_TRADE_SOL || "25");
-  const cteArgs = [windowStart, windowStart, minWhaleSol];
-  const WHALE_CTE = (await tableExists(env, "wallet_funding")) ? WHALE_CTE_FUNDED : WHALE_CTE_UNFUNDED;
+  const hasFunding = await tableExists(env, "wallet_funding");
+  const WHALE_CTE = hasFunding ? WHALE_CTE_FUNDED : WHALE_CTE_UNFUNDED;
+  const cteArgs = hasFunding
+    ? [
+        windowStart,
+        Math.max(1, parseInt(env.FUNDING_MAX_HOPS || String(DEFAULT_FUNDING_MAX_HOPS), 10)),
+        Math.max(1, parseInt(env.FUNDING_HUB_FANOUT || String(DEFAULT_HUB_FANOUT_CAP), 10)),
+        windowStart,
+        minWhaleSol,
+      ]
+    : [windowStart, windowStart, minWhaleSol];
 
   const flows = await env.DB.prepare(
     WHALE_CTE +

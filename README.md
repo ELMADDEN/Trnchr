@@ -9,7 +9,7 @@ Helius (watches the chain, free tier)
 Cloudflare Worker  /webhook     ← the COLLECTOR: stores every swap ≥ DUST_FLOOR_SOL, prices
    ▼                              them in USD and resolves symbols via Jupiter (free, no key)
 Cloudflare D1 database          ← the MEMORY: every trade, forever, plus each wallet's
-   ▼                              best-effort funding source (via Helius, optional)
+   ▼                              best-effort funding chain, up to a few hops (via Helius, optional)
 Query time                      ← "whale" = an actor (wallet, or wallets sharing a funder)
    ▼                              whose CUMULATIVE volume clears MIN_TRADE_SOL in the window —
    ▼                              catches a big buy split into many small ones
@@ -87,6 +87,8 @@ Cloudflare → **Workers & Pages** → `whale-radar` → **Settings** → **Vari
 | `DUST_FLOOR_SOL` | *(optional, default `1`)* the smallest single trade worth storing at all — lower catches finer-grained split-transaction structuring, at the cost of more D1 writes |
 | `ANTHROPIC_API_KEY` | *(optional)* an API key from console.anthropic.com — turns on the AI analyst |
 | `HELIUS_API_KEY` | *(optional)* an API key from your Helius dashboard (Settings → API Keys — different from the webhook secret) — turns on wallet-funding lookups, which cluster whale activity split across multiple wallets |
+| `FUNDING_MAX_HOPS` | *(optional, default `2`)* how many funding edges to trace back per wallet — `2` means wallet → funder → funder's funder; only matters with `HELIUS_API_KEY` set |
+| `FUNDING_HUB_FANOUT` | *(optional, default `3`)* an address that's funded more than this many distinct wallets is treated as a shared hub (CEX/router) and the chain stops there instead of clustering through it |
 
 Click Deploy/Save after adding them.
 
@@ -94,7 +96,9 @@ USD pricing and token symbols use Jupiter's free public API (lite-api.jup.ag); l
 
 ### How whale detection works
 
-Filtering by single-trade size is trivial to bypass — split one 100 SOL buy into ten 10 SOL buys and a naive `sol_amount >= threshold` check never fires. So this doesn't filter at ingestion: it stores every trade above the tiny `DUST_FLOOR_SOL` floor, then at query time groups trades by **actor** — a wallet, or (if `HELIUS_API_KEY` is set) a cluster of wallets that all received their SOL from the same funding address — and checks whether that actor's *cumulative* buy+sell volume in the selected time window clears `MIN_TRADE_SOL`. Qualifying actors' full trade history in the window counts toward flows, not just the trade that tipped them over. Without `HELIUS_API_KEY`, an actor is just its own wallet (still fixes the split-transaction case); with it, wallets funded from a shared source are merged into one actor (also catches the split-*wallet* case) and surfaced in the **Wallet clusters** panel.
+Filtering by single-trade size is trivial to bypass — split one 100 SOL buy into ten 10 SOL buys and a naive `sol_amount >= threshold` check never fires. So this doesn't filter at ingestion: it stores every trade above the tiny `DUST_FLOOR_SOL` floor, then at query time groups trades by **actor** — a wallet, or (if `HELIUS_API_KEY` is set) a cluster of wallets sharing a funding source — and checks whether that actor's *cumulative* buy+sell volume in the selected time window clears `MIN_TRADE_SOL`. Qualifying actors' full trade history in the window counts toward flows, not just the trade that tipped them over.
+
+Without `HELIUS_API_KEY`, an actor is just its own wallet (still fixes the split-*transaction* case). With it, each wallet's funding chain is traced back up to `FUNDING_MAX_HOPS` edges (wallet → funder → funder's funder by default) and wallets that land on the same chain root are merged into one actor — catching a whale that spreads buys across several wallets, even if those wallets were funded through an extra hop rather than directly. The chain stops early at any address that's already funded more than `FUNDING_HUB_FANOUT` distinct wallets, since that's almost certainly a shared exchange or router, not a personal funding wallet — without that guard, tracing far enough back would eventually converge on some CEX withdrawal address and falsely merge dozens of unrelated whales into one. Detected clusters are surfaced in the **Wallet clusters** panel.
 
 ### Step 5 — Point Helius at it
 1. Sign up free at helius.dev → dashboard → **Webhooks** → **New Webhook**.
@@ -124,7 +128,7 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 ## Costs
 
 - Cloudflare Workers + D1 free tier: 100k requests/day, 5GB storage — should still be plenty for a small watchlist, but note that storing every trade above `DUST_FLOOR_SOL` (instead of only trades already past the whale threshold) means noticeably more D1 writes than earlier versions on an active token. Raise `DUST_FLOOR_SOL` if you're worried about volume.
-- Helius free tier: enough webhook capacity for a small watchlist; the optional funding-source lookup uses Helius's Enhanced Transactions API, called once per newly-seen wallet then cached for 2 weeks.
+- Helius free tier: enough webhook capacity for a small watchlist; the optional funding-source lookup uses Helius's Enhanced Transactions API, called once per newly-seen address (wallet, then its funder, then its funder's funder, up to `FUNDING_MAX_HOPS`) and cached for 2 weeks — a deeper `FUNDING_MAX_HOPS` means more calls per new wallet, bounded by the hub cap kicking in once a chain hits shared infrastructure.
 - Jupiter Price/Token API and DexScreener API: both free tier, no key required.
 - Claude API analyst: optional; 4 short calls/day ≈ a few cents.
 
@@ -134,7 +138,7 @@ Open `https://whale-radar.YOURNAME.workers.dev` — within minutes of the first 
 - Market stats (price change, market cap, liquidity, volume, whale dominance) are *live*, from DexScreener, cached for ~90 seconds — unlike trade USD values, these reflect right now, not the moment of the trade. A token with no indexed DexScreener pair yet just won't show them.
 - Token symbols come from Jupiter's token list; very new or unlisted tokens may still show as a shortened contract address until Jupiter indexes them.
 - Very early **pump.fun bonding-curve** trades don't always parse as clean swaps; tokens that have migrated (Raydium/PumpSwap) work best.
-- Wallet-funding clustering looks at each wallet's most recent handful of transfers, not a full recursive funding graph — it catches naive same-source sybil wallets, not a determined actor routing through several hops or a CEX withdrawal per wallet. It can also mislabel a DEX/router address as the "funder" if that's genuinely the most recent SOL inflow (e.g. proceeds from an earlier sell). Treat clusters as a strong hint, not proof.
+- Wallet-funding clustering looks at each wallet's most recent handful of transfers and walks a bounded number of hops (`FUNDING_MAX_HOPS`), not an exhaustive forensic graph — it catches same-source sybil wallets a few hops deep, not a determined actor who routes through more hops than that or funds each wallet from a fresh CEX withdrawal. It can also mislabel a DEX/router address as the "funder" if that's genuinely the most recent SOL inflow (e.g. proceeds from an earlier sell) — the hub-fanout cap (`FUNDING_HUB_FANOUT`) catches this once an address has funded enough *distinct* wallets in your own data, but a hub's first appearance can still slip through once. Treat clusters as a strong hint, not proof.
 - "Whale" = size (now cumulative per actor, not per trade). Scoring *which* wallets are historically good traders (a true smart-money/PnL score) is still future work — the wallet links on the dashboard are how you start building that list manually.
 
 ## Troubleshooting
