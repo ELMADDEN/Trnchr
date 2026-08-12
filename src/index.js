@@ -816,6 +816,18 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
        GROUP BY bucket ORDER BY bucket`
   ).bind(...cteArgs, bucketSeconds, windowStart).all();
 
+  // same bucketing, but per-token — powers each row's sparkline + spike badge
+  const tokenBuckets = await env.DB.prepare(
+    WHALE_CTE +
+      `SELECT t.mint, CAST(t.ts/? AS INTEGER) AS bucket,
+              SUM(CASE WHEN t.side='BUY' THEN t.sol_amount ELSE -t.sol_amount END) AS net
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       WHERE t.ts >= ?
+       GROUP BY t.mint, bucket ORDER BY t.mint, bucket`
+  ).bind(...cteArgs, bucketSeconds, windowStart).all();
+
   // multi-wallet actors ("clusters") for the Wallet clusters panel
   const clusters = await env.DB.prepare(
     WHALE_CTE +
@@ -850,6 +862,7 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
     recent: recent.results || [],
     verdict,
     buckets: buckets.results || [],
+    tokenBuckets: tokenBuckets.results || [],
     bucketSeconds,
     clusters: clusters.results || [],
     totals,
@@ -932,7 +945,7 @@ async function dashboard(env, window) {
     );
   }
 
-  const { flows, recent, verdict, buckets, bucketSeconds, clusters, totals } = data;
+  const { flows, recent, verdict, buckets, tokenBuckets, bucketSeconds, clusters, totals } = data;
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
   let market = {};
@@ -965,6 +978,12 @@ async function dashboard(env, window) {
     series.push(Math.round(cum * 10) / 10);
   }
 
+  // per-token bucket series, for each row's sparkline + spike badge
+  const tokenBucketMap = {};
+  tokenBuckets.forEach((b) => {
+    (tokenBucketMap[b.mint] ||= {})[b.bucket] = b.net;
+  });
+
   const flowRows = flows
     .map((f, i) => {
       const net = f.buy_sol - f.sell_sol;
@@ -982,6 +1001,17 @@ async function dashboard(env, window) {
         m.market_cap ? `MC $${fmtUsd(m.market_cap)}` : "",
         m.liquidity_usd ? `LP $${fmtUsd(m.liquidity_usd)}` : "",
       ].filter(Boolean).join(" · ");
+
+      // this token's own pace over the same ~24 buckets as the hero pulse
+      const bm = tokenBucketMap[f.mint] || {};
+      const sparkVals = [];
+      for (let b = 23; b >= 0; b--) sparkVals.push(bm[nowBucket - b] || 0);
+      const lastVal = sparkVals[sparkVals.length - 1];
+      const priorVals = sparkVals.slice(0, -1);
+      const avgMag = priorVals.reduce((a, v) => a + Math.abs(v), 0) / priorVals.length;
+      const lastMag = Math.abs(lastVal);
+      const spikeRatio = avgMag > 0 ? lastMag / avgMag : 0;
+      const isSpike = avgMag > 0.01 && lastMag >= avgMag * 2;
 
       return `<div class="frow"${i === 0 ? ' style="border-top:none"' : ""}>
         <div class="frow-head">
@@ -1002,22 +1032,32 @@ async function dashboard(env, window) {
             ${netUsd ? `<span class="netusd">${netUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(netUsd))}</span>` : ""}
           </span>
         </div>
+        <div class="spark-row">
+          <span class="spark-lbl">pace</span>
+          ${sparkline(sparkVals)}
+          ${isSpike ? `<span class="spike" title="Latest bucket is ${spikeRatio.toFixed(1)}x this token's average pace">⚡ ${spikeRatio.toFixed(1)}x</span>` : ""}
+        </div>
         ${dominance != null ? `<div class="dom" title="Whale-sized volume as a share of ${WINDOW_LABELS[window]} DEX volume"><b style="width:${dominance}%"></b><span class="domlbl">${dominance.toFixed(0)}% whale-dominated</span></div>` : ""}
       </div>`;
     })
     .join("");
 
+  const maxRecentSol = Math.max(1, ...recent.map((r) => r.sol_amount));
   const recentRows = recent
     .map((r, i) => {
       const isBuy = r.side === "BUY";
       const t = new Date(r.ts * 1000);
       const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
-      return `<div class="trow"${i === 0 ? ' style="border-top:none"' : ""}>
-        <span class="tm">${hm}</span>
-        <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
-        <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
-        <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
-        <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}${r.wallet_count > 1 ? '<b class="dot" title="Part of a multi-wallet cluster"></b>' : ""}</a>
+      const weightPct = Math.max(4, (r.sol_amount / maxRecentSol) * 100); // floor so small trades still show a sliver
+      return `<div class="trow-wrap"${i === 0 ? ' style="border-top:none"' : ""}>
+        <div class="trow">
+          <span class="tm">${hm}</span>
+          <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
+          <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
+          <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
+          <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}${r.wallet_count > 1 ? '<b class="dot" title="Part of a multi-wallet cluster"></b>' : ""}</a>
+        </div>
+        <div class="tbar" title="Size relative to the largest trade shown"><b class="${isBuy ? "pos" : "neg"}" style="width:${weightPct}%"></b></div>
       </div>`;
     })
     .join("");
@@ -1083,15 +1123,24 @@ async function dashboard(env, window) {
   .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
   .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
   .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
+  .spark-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .spark-lbl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;flex:none}
+  .spark{flex:none;display:block}
+  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(106,90,205,.14);color:#6a5acd}
   .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
-  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .trow-wrap{padding-top:8px;border-top:0.5px solid var(--line)}
+  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;font-size:12px}
   .tm{color:var(--mut);font-variant-numeric:tabular-nums}
   .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
   .tusd{font-weight:400;color:var(--mut);font-size:10px}
   .tsym{color:var(--mut);padding-left:8px}
   .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
   .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
+  .tbar{height:2px;border-radius:2px;background:var(--line);margin:6px 0 8px;overflow:hidden}
+  .tbar b{display:block;height:100%;border-radius:2px}
+  .tbar b.pos{background:var(--teal)}
+  .tbar b.neg{background:var(--coral)}
   .empty{color:var(--mut);padding:10px 0;font-size:13px}
   .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
   .csym{font-weight:600;flex:none}
@@ -1179,6 +1228,18 @@ const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;
 
 /** "$BONK" if we have a Jupiter symbol for this row's mint, else a shortened mint address. */
 const tokenLabel = (row) => "$" + (row.symbol || short(row.mint));
+
+/** Tiny inline SVG line sparkline for a token's recent per-bucket net flow (not cumulative — shows pace, not total). */
+function sparkline(values) {
+  const w = 60, h = 18;
+  const max = Math.max(0.001, ...values.map((v) => Math.abs(v)));
+  const stepX = w / Math.max(1, values.length - 1);
+  const pts = values
+    .map((v, i) => `${(i * stepX).toFixed(1)},${(h / 2 - (v / max) * (h / 2 - 2)).toFixed(1)}`)
+    .join(" ");
+  const lastPos = values[values.length - 1] >= 0;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="spark"><polyline points="${pts}" fill="none" stroke="${lastPos ? "#12b886" : "#ff5a4d"}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
 
 /** Compact USD figure: 1.2M, 4.5k, or a plain integer. */
 function fmtUsd(n) {
