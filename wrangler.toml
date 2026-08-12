@@ -2,9 +2,10 @@ name = "trnchr"
 main = "src/index.js"
 compatibility_date = "2026-08-01"
 
-# Cron: the analyst runs every 6 hours (UTC)
+# Cron: the analyst runs every 6 hours (UTC); the trending-watchlist sync
+# (only active if HELIUS_WEBHOOK_ID is set) runs every 2 hours (UTC)
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 */6 * * *", "0 */2 * * *"]
 
 # D1 database binding.
 # After you create the database in the Cloudflare dashboard,

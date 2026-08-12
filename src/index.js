@@ -9,6 +9,9 @@
  *   4. Every 6 hours, an "analyst" cron summarises the last 24h
  *      (uses the Claude API if ANTHROPIC_API_KEY is set, otherwise
  *       writes a plain computed summary)
+ *   5. TEMPORARY: GET /debug/funding-origin?key=WEBHOOK_SECRET&wallet=...
+ *      looks up a wallet's earliest funder, for validating a coordinated-
+ *      wallet-cluster detection layer against known cases. Delete once done.
  *
  * "Whale" is a CUMULATIVE, QUERY-TIME concept, not a per-trade filter:
  * an "actor" (a wallet, or a cluster of wallets sharing a funder — see
@@ -27,6 +30,9 @@
  *   HELIUS_API_KEY      optional — enables wallet-funding lookups, which cluster whale activity split across multiple wallets funded by the same source
  *   FUNDING_MAX_HOPS    optional — how many funding edges to trace back per wallet (default 2: wallet -> funder -> funder's funder); only matters with HELIUS_API_KEY set
  *   FUNDING_HUB_FANOUT  optional — an address that has funded more than this many distinct wallets is treated as a hub (CEX/router), never clustered through (default 3)
+ *   HELIUS_WEBHOOK_ID   optional — your Helius webhook's ID (from its dashboard page, NOT the webhook secret). Setting this turns on auto-tracking: every 2h, the Worker fetches trending Solana tokens from DexScreener and rewrites your Helius webhook's watched addresses to match. Manual edits to the watchlist in the Helius dashboard will be overwritten on the next sync — see PINNED_TOKENS to keep specific tokens always-watched.
+ *   AUTO_TRACK_TOP_N    optional — how many trending tokens to auto-track (default 10)
+ *   PINNED_TOKENS       optional — comma-separated mint addresses always kept in the watchlist alongside the trending ones
  *
  * USD pricing and token symbols come from Jupiter's free public API
  * (lite-api.jup.ag — no key or signup needed). Live market stats (price
@@ -45,13 +51,22 @@ const SOL_MINT = "So11111111111111111111111111111111111111112";
 const JUPITER_PRICE_URL = "https://lite-api.jup.ag/price/v3";
 const JUPITER_TOKEN_URL = "https://lite-api.jup.ag/tokens/v2/search";
 const DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana";
+const DEXSCREENER_TRENDING_URL = "https://api.dexscreener.com/metas/trending/v1";
 const HELIUS_API_URL = "https://api.helius.xyz/v0/addresses";
+const HELIUS_WEBHOOK_URL = "https://api.helius.xyz/v0/webhooks";
+const HELIUS_RPC_URL = "https://mainnet.helius-rpc.com";
+const HELIUS_TX_URL = "https://api.helius.xyz/v0/transactions";
+const FUNDING_ORIGIN_MAX_PAGES = 10; // cap signature pagination at 10k txs — a wallet needing more than that isn't a useful funding-origin subject anyway
 const TOKEN_META_TTL = 7 * 86400;      // refresh cached symbols weekly
 const MARKET_CACHE_TTL = 90;           // refresh cached market stats every 90s
 const FUNDING_CACHE_TTL = 14 * 86400;  // recheck a wallet's funding source every 2 weeks
 const MIN_TRANSFER_LAMPORTS = 0.05 * 1e9; // ignore dust/fee-relay transfers when looking for a funder
 const DEFAULT_FUNDING_MAX_HOPS = 2;  // wallet -> funder -> funder's funder
 const DEFAULT_HUB_FANOUT_CAP = 3;    // an address funding more than this many distinct wallets is a hub (CEX/router), not a personal funder
+const DEFAULT_AUTO_TRACK_TOP_N = 10;
+const MAX_WATCHLIST_SIZE = 50;       // defensive cap regardless of config, independent of any Helius-side limit
+const ANALYST_CRON = "0 */6 * * *";
+const TRENDING_SYNC_CRON = "0 */2 * * *";
 
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
@@ -71,6 +86,20 @@ export default {
       const data = await getFlows(env, WINDOWS[window]);
       return json({ window, ...data });
     }
+    if (url.pathname === "/debug/funding-origin") {
+      // Temporary: validates the earliest-funder lookup against known
+      // coordinated-wallet cases before it becomes a real detection layer.
+      // Gated behind the same secret as the webhook so it can't be used to
+      // burn your Helius quota by anyone who finds the URL. Delete this
+      // route once that validation is done.
+      if (!env.WEBHOOK_SECRET || url.searchParams.get("key") !== env.WEBHOOK_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const wallet = url.searchParams.get("wallet");
+      if (!wallet) return json({ error: "pass ?wallet=<address>" }, 400);
+      if (!env.HELIUS_API_KEY) return json({ error: "HELIUS_API_KEY not set" }, 400);
+      return json(await findFundingOrigin(env, wallet));
+    }
     if (url.pathname === "/") {
       return dashboard(env, parseWindow(url));
     }
@@ -79,7 +108,11 @@ export default {
 
   // ---------------------------------------------------------------- CRON ----
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runAnalyst(env));
+    if (event.cron === TRENDING_SYNC_CRON) {
+      ctx.waitUntil(syncTrendingWatchlist(env));
+    } else {
+      ctx.waitUntil(runAnalyst(env));
+    }
   },
 };
 
@@ -340,6 +373,74 @@ async function filterOutHubs(env, addresses) {
 }
 
 /**
+ * DEBUG / VALIDATION ONLY — not wired into the detection pipeline.
+ *
+ * Finds a wallet's EARLIEST incoming external SOL transfer — who originally
+ * funded it — as opposed to resolveFundingSource() above, which tracks the
+ * MOST RECENT funder for merging split-wallet whale volume into one actor.
+ * "Earliest funder" is the signal for a different question: who set this
+ * wallet up in the first place, which is what coordinated-insider-wallet
+ * detection actually needs.
+ *
+ * Neither Solana's RPC nor Helius's API has a "first transaction" call —
+ * signature history only comes back newest-first. So this pages backwards
+ * via getSignaturesForAddress until a page comes back short (the tail of
+ * history), then pulls the parsed nativeTransfers for that oldest signature
+ * via Helius's Enhanced Transaction API to read off the sender.
+ */
+async function findFundingOrigin(env, wallet) {
+  let before;
+  let sigs = [];
+  let pages = 0;
+  try {
+    do {
+      const params = before ? [wallet, { limit: 1000, before }] : [wallet, { limit: 1000 }];
+      const res = await fetch(`${HELIUS_RPC_URL}/?api-key=${env.HELIUS_API_KEY}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) return { wallet, error: `rpc ${res.status}` };
+      const data = await res.json();
+      sigs = data.result || [];
+      pages++;
+      if (sigs.length) before = sigs[sigs.length - 1].signature;
+    } while (sigs.length === 1000 && pages < FUNDING_ORIGIN_MAX_PAGES);
+  } catch (e) {
+    return { wallet, error: `rpc error: ${e.message}` };
+  }
+
+  if (!sigs.length) return { wallet, error: "no transaction history found" };
+  const oldest = sigs[sigs.length - 1].signature;
+  const truncated = pages >= FUNDING_ORIGIN_MAX_PAGES && sigs.length === 1000;
+
+  try {
+    const txRes = await fetch(`${HELIUS_TX_URL}?api-key=${env.HELIUS_API_KEY}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ transactions: [oldest] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!txRes.ok) return { wallet, oldest_signature: oldest, error: `tx fetch ${txRes.status}` };
+    const [tx] = await txRes.json();
+    const nativeTransfers = tx?.nativeTransfers || [];
+    const funding = nativeTransfers.find((nt) => nt.toUserAccount === wallet && nt.fromUserAccount !== wallet);
+    return {
+      wallet,
+      oldest_signature: oldest,
+      pages_scanned: pages,
+      truncated, // true means we hit the page cap before finding the true first tx
+      funded_by: funding?.fromUserAccount || null,
+      funded_amount_sol: funding ? funding.amount / 1e9 : null,
+      native_transfers: nativeTransfers,
+    };
+  } catch (e) {
+    return { wallet, oldest_signature: oldest, error: `tx fetch error: ${e.message}` };
+  }
+}
+
+/**
  * Live market stats (price, 24h change, market cap, liquidity, volume)
  * per mint via a local D1 cache backed by DexScreener. A mint can have
  * several pools; the deepest-liquidity pair is used. Returns a map keyed
@@ -430,6 +531,106 @@ async function getMarketData(env, mints) {
   }
 
   return market;
+}
+
+// ============================================================ TRENDING =====
+
+/**
+ * Best-effort: fetch up to `limit` Solana token mints from DexScreener's
+ * trending endpoint. The exact response shape isn't fully documented for
+ * third-party use, so this parses defensively — several possible wrapper
+ * keys and several possible per-item address fields — and returns an empty
+ * list rather than throwing if the shape doesn't match what's expected.
+ */
+async function fetchTrendingMints(limit) {
+  try {
+    const res = await fetch(`${DEXSCREENER_TRENDING_URL}?chainId=solana`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const list = Array.isArray(data)
+      ? data
+      : Array.isArray(data?.pairs)
+      ? data.pairs
+      : Array.isArray(data?.tokens)
+      ? data.tokens
+      : Array.isArray(data?.data)
+      ? data.data
+      : [];
+
+    const mints = [];
+    for (const item of list) {
+      const mint = item?.tokenAddress || item?.address || item?.baseToken?.address || item?.mint;
+      if (mint && !mints.includes(mint)) mints.push(mint);
+      if (mints.length >= limit) break;
+    }
+    return mints;
+  } catch (e) {
+    console.log("dexscreener trending fetch error", e.message);
+    return [];
+  }
+}
+
+/**
+ * Rewrites the Helius webhook's watched addresses to [PINNED_TOKENS,
+ * ...top trending]. No-ops entirely unless HELIUS_API_KEY and
+ * HELIUS_WEBHOOK_ID are both set. Fetches the webhook's current full
+ * config first and PUTs it back with only accountAddresses changed, so
+ * every other setting (transaction types, webhook type, auth header, …)
+ * configured in the Helius dashboard is preserved untouched. Skips the
+ * PUT entirely if the desired address set already matches — avoids
+ * needless API calls and log noise on every sync tick.
+ */
+async function syncTrendingWatchlist(env) {
+  if (!env.HELIUS_API_KEY || !env.HELIUS_WEBHOOK_ID) return;
+
+  const topN = Math.max(
+    1,
+    Math.min(MAX_WATCHLIST_SIZE, parseInt(env.AUTO_TRACK_TOP_N || String(DEFAULT_AUTO_TRACK_TOP_N), 10))
+  );
+  const trending = await fetchTrendingMints(topN);
+  if (!trending.length) {
+    console.log("trending sync: no trending tokens fetched, skipping this cycle");
+    return;
+  }
+
+  const pinned = (env.PINNED_TOKENS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const desired = [...new Set([...pinned, ...trending])].slice(0, MAX_WATCHLIST_SIZE);
+
+  try {
+    const getRes = await fetch(`${HELIUS_WEBHOOK_URL}/${env.HELIUS_WEBHOOK_ID}?api-key=${env.HELIUS_API_KEY}`, {
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!getRes.ok) {
+      console.log("trending sync: failed to fetch current webhook config", getRes.status);
+      return;
+    }
+    const current = await getRes.json();
+    const currentAddresses = Array.isArray(current.accountAddresses) ? current.accountAddresses : [];
+
+    const unchanged =
+      currentAddresses.length === desired.length && currentAddresses.every((a) => desired.includes(a));
+    if (unchanged) return;
+
+    const putRes = await fetch(`${HELIUS_WEBHOOK_URL}/${env.HELIUS_WEBHOOK_ID}?api-key=${env.HELIUS_API_KEY}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...current, accountAddresses: desired }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!putRes.ok) {
+      console.log("trending sync: failed to update webhook", putRes.status, await putRes.text());
+      return;
+    }
+    console.log(`trending sync: watchlist updated to ${desired.length} addresses`);
+  } catch (e) {
+    console.log("trending sync error", e.message);
+  }
 }
 
 /** Turn a Helius "enhanced" transaction into {signature, ts, wallet, mint, side, sol_amount} or null. */
@@ -615,6 +816,18 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
        GROUP BY bucket ORDER BY bucket`
   ).bind(...cteArgs, bucketSeconds, windowStart).all();
 
+  // same bucketing, but per-token — powers each row's sparkline + spike badge
+  const tokenBuckets = await env.DB.prepare(
+    WHALE_CTE +
+      `SELECT t.mint, CAST(t.ts/? AS INTEGER) AS bucket,
+              SUM(CASE WHEN t.side='BUY' THEN t.sol_amount ELSE -t.sol_amount END) AS net
+       FROM trades t
+       JOIN actor_map am ON am.wallet = t.wallet
+       JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
+       WHERE t.ts >= ?
+       GROUP BY t.mint, bucket ORDER BY t.mint, bucket`
+  ).bind(...cteArgs, bucketSeconds, windowStart).all();
+
   // multi-wallet actors ("clusters") for the Wallet clusters panel
   const clusters = await env.DB.prepare(
     WHALE_CTE +
@@ -649,6 +862,7 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
     recent: recent.results || [],
     verdict,
     buckets: buckets.results || [],
+    tokenBuckets: tokenBuckets.results || [],
     bucketSeconds,
     clusters: clusters.results || [],
     totals,
@@ -731,7 +945,7 @@ async function dashboard(env, window) {
     );
   }
 
-  const { flows, recent, verdict, buckets, bucketSeconds, clusters, totals } = data;
+  const { flows, recent, verdict, buckets, tokenBuckets, bucketSeconds, clusters, totals } = data;
   const minSol = env.MIN_TRADE_SOL || 25;
   const maxFlow = Math.max(1, ...flows.map((f) => Math.max(f.buy_sol, f.sell_sol)));
   let market = {};
@@ -764,6 +978,12 @@ async function dashboard(env, window) {
     series.push(Math.round(cum * 10) / 10);
   }
 
+  // per-token bucket series, for each row's sparkline + spike badge
+  const tokenBucketMap = {};
+  tokenBuckets.forEach((b) => {
+    (tokenBucketMap[b.mint] ||= {})[b.bucket] = b.net;
+  });
+
   const flowRows = flows
     .map((f, i) => {
       const net = f.buy_sol - f.sell_sol;
@@ -781,6 +1001,17 @@ async function dashboard(env, window) {
         m.market_cap ? `MC $${fmtUsd(m.market_cap)}` : "",
         m.liquidity_usd ? `LP $${fmtUsd(m.liquidity_usd)}` : "",
       ].filter(Boolean).join(" · ");
+
+      // this token's own pace over the same ~24 buckets as the hero pulse
+      const bm = tokenBucketMap[f.mint] || {};
+      const sparkVals = [];
+      for (let b = 23; b >= 0; b--) sparkVals.push(bm[nowBucket - b] || 0);
+      const lastVal = sparkVals[sparkVals.length - 1];
+      const priorVals = sparkVals.slice(0, -1);
+      const avgMag = priorVals.reduce((a, v) => a + Math.abs(v), 0) / priorVals.length;
+      const lastMag = Math.abs(lastVal);
+      const spikeRatio = avgMag > 0 ? lastMag / avgMag : 0;
+      const isSpike = avgMag > 0.01 && lastMag >= avgMag * 2;
 
       return `<div class="frow"${i === 0 ? ' style="border-top:none"' : ""}>
         <div class="frow-head">
@@ -801,22 +1032,32 @@ async function dashboard(env, window) {
             ${netUsd ? `<span class="netusd">${netUsd >= 0 ? "+" : "-"}$${fmtUsd(Math.abs(netUsd))}</span>` : ""}
           </span>
         </div>
+        <div class="spark-row">
+          <span class="spark-lbl">pace</span>
+          ${sparkline(sparkVals)}
+          ${isSpike ? `<span class="spike" title="Latest bucket is ${spikeRatio.toFixed(1)}x this token's average pace">⚡ ${spikeRatio.toFixed(1)}x</span>` : ""}
+        </div>
         ${dominance != null ? `<div class="dom" title="Whale-sized volume as a share of ${WINDOW_LABELS[window]} DEX volume"><b style="width:${dominance}%"></b><span class="domlbl">${dominance.toFixed(0)}% whale-dominated</span></div>` : ""}
       </div>`;
     })
     .join("");
 
+  const maxRecentSol = Math.max(1, ...recent.map((r) => r.sol_amount));
   const recentRows = recent
     .map((r, i) => {
       const isBuy = r.side === "BUY";
       const t = new Date(r.ts * 1000);
       const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
-      return `<div class="trow"${i === 0 ? ' style="border-top:none"' : ""}>
-        <span class="tm">${hm}</span>
-        <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
-        <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
-        <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
-        <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}${r.wallet_count > 1 ? '<b class="dot" title="Part of a multi-wallet cluster"></b>' : ""}</a>
+      const weightPct = Math.max(4, (r.sol_amount / maxRecentSol) * 100); // floor so small trades still show a sliver
+      return `<div class="trow-wrap"${i === 0 ? ' style="border-top:none"' : ""}>
+        <div class="trow">
+          <span class="tm">${hm}</span>
+          <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
+          <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
+          <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
+          <a class="tw" href="https://gmgn.ai/sol/address/${r.wallet}" target="_blank">${short(r.wallet)}${r.wallet_count > 1 ? '<b class="dot" title="Part of a multi-wallet cluster"></b>' : ""}</a>
+        </div>
+        <div class="tbar" title="Size relative to the largest trade shown"><b class="${isBuy ? "pos" : "neg"}" style="width:${weightPct}%"></b></div>
       </div>`;
     })
     .join("");
@@ -882,15 +1123,24 @@ async function dashboard(env, window) {
   .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
   .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
   .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
+  .spark-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .spark-lbl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;flex:none}
+  .spark{flex:none;display:block}
+  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(106,90,205,.14);color:#6a5acd}
   .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
-  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .trow-wrap{padding-top:8px;border-top:0.5px solid var(--line)}
+  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;font-size:12px}
   .tm{color:var(--mut);font-variant-numeric:tabular-nums}
   .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
   .tusd{font-weight:400;color:var(--mut);font-size:10px}
   .tsym{color:var(--mut);padding-left:8px}
   .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
   .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
+  .tbar{height:2px;border-radius:2px;background:var(--line);margin:6px 0 8px;overflow:hidden}
+  .tbar b{display:block;height:100%;border-radius:2px}
+  .tbar b.pos{background:var(--teal)}
+  .tbar b.neg{background:var(--coral)}
   .empty{color:var(--mut);padding:10px 0;font-size:13px}
   .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
   .csym{font-weight:600;flex:none}
@@ -972,11 +1222,24 @@ setTimeout(function(){location.reload();},60000);
 // ============================================================ HELPERS ======
 
 const short = (s) => (s && s.length > 12 ? s.slice(0, 4) + "…" + s.slice(-4) : s || "");
-const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
+const json = (o, status = 200) =>
+  new Response(JSON.stringify(o, null, 2), { status, headers: { "content-type": "application/json" } });
 const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
 /** "$BONK" if we have a Jupiter symbol for this row's mint, else a shortened mint address. */
 const tokenLabel = (row) => "$" + (row.symbol || short(row.mint));
+
+/** Tiny inline SVG line sparkline for a token's recent per-bucket net flow (not cumulative — shows pace, not total). */
+function sparkline(values) {
+  const w = 60, h = 18;
+  const max = Math.max(0.001, ...values.map((v) => Math.abs(v)));
+  const stepX = w / Math.max(1, values.length - 1);
+  const pts = values
+    .map((v, i) => `${(i * stepX).toFixed(1)},${(h / 2 - (v / max) * (h / 2 - 2)).toFixed(1)}`)
+    .join(" ");
+  const lastPos = values[values.length - 1] >= 0;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="spark"><polyline points="${pts}" fill="none" stroke="${lastPos ? "#12b886" : "#ff5a4d"}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
 
 /** Compact USD figure: 1.2M, 4.5k, or a plain integer. */
 function fmtUsd(n) {
