@@ -9,6 +9,9 @@
  *   4. Every 6 hours, an "analyst" cron summarises the last 24h
  *      (uses the Claude API if ANTHROPIC_API_KEY is set, otherwise
  *       writes a plain computed summary)
+ *   5. TEMPORARY: GET /debug/funding-origin?key=WEBHOOK_SECRET&wallet=...
+ *      looks up a wallet's earliest funder, for validating a coordinated-
+ *      wallet-cluster detection layer against known cases. Delete once done.
  *
  * "Whale" is a CUMULATIVE, QUERY-TIME concept, not a per-trade filter:
  * an "actor" (a wallet, or a cluster of wallets sharing a funder — see
@@ -51,6 +54,9 @@ const DEXSCREENER_URL = "https://api.dexscreener.com/tokens/v1/solana";
 const DEXSCREENER_TRENDING_URL = "https://api.dexscreener.com/metas/trending/v1";
 const HELIUS_API_URL = "https://api.helius.xyz/v0/addresses";
 const HELIUS_WEBHOOK_URL = "https://api.helius.xyz/v0/webhooks";
+const HELIUS_RPC_URL = "https://mainnet.helius-rpc.com";
+const HELIUS_TX_URL = "https://api.helius.xyz/v0/transactions";
+const FUNDING_ORIGIN_MAX_PAGES = 10; // cap signature pagination at 10k txs — a wallet needing more than that isn't a useful funding-origin subject anyway
 const TOKEN_META_TTL = 7 * 86400;      // refresh cached symbols weekly
 const MARKET_CACHE_TTL = 90;           // refresh cached market stats every 90s
 const FUNDING_CACHE_TTL = 14 * 86400;  // recheck a wallet's funding source every 2 weeks
@@ -79,6 +85,20 @@ export default {
       const window = parseWindow(url);
       const data = await getFlows(env, WINDOWS[window]);
       return json({ window, ...data });
+    }
+    if (url.pathname === "/debug/funding-origin") {
+      // Temporary: validates the earliest-funder lookup against known
+      // coordinated-wallet cases before it becomes a real detection layer.
+      // Gated behind the same secret as the webhook so it can't be used to
+      // burn your Helius quota by anyone who finds the URL. Delete this
+      // route once that validation is done.
+      if (!env.WEBHOOK_SECRET || url.searchParams.get("key") !== env.WEBHOOK_SECRET) {
+        return new Response("unauthorized", { status: 401 });
+      }
+      const wallet = url.searchParams.get("wallet");
+      if (!wallet) return json({ error: "pass ?wallet=<address>" }, 400);
+      if (!env.HELIUS_API_KEY) return json({ error: "HELIUS_API_KEY not set" }, 400);
+      return json(await findFundingOrigin(env, wallet));
     }
     if (url.pathname === "/") {
       return dashboard(env, parseWindow(url));
@@ -349,6 +369,74 @@ async function filterOutHubs(env, addresses) {
   } catch (e) {
     console.log("hub fanout check error", e.message);
     return unique; // best-effort — still bounded by the hop count either way
+  }
+}
+
+/**
+ * DEBUG / VALIDATION ONLY — not wired into the detection pipeline.
+ *
+ * Finds a wallet's EARLIEST incoming external SOL transfer — who originally
+ * funded it — as opposed to resolveFundingSource() above, which tracks the
+ * MOST RECENT funder for merging split-wallet whale volume into one actor.
+ * "Earliest funder" is the signal for a different question: who set this
+ * wallet up in the first place, which is what coordinated-insider-wallet
+ * detection actually needs.
+ *
+ * Neither Solana's RPC nor Helius's API has a "first transaction" call —
+ * signature history only comes back newest-first. So this pages backwards
+ * via getSignaturesForAddress until a page comes back short (the tail of
+ * history), then pulls the parsed nativeTransfers for that oldest signature
+ * via Helius's Enhanced Transaction API to read off the sender.
+ */
+async function findFundingOrigin(env, wallet) {
+  let before;
+  let sigs = [];
+  let pages = 0;
+  try {
+    do {
+      const params = before ? [wallet, { limit: 1000, before }] : [wallet, { limit: 1000 }];
+      const res = await fetch(`${HELIUS_RPC_URL}/?api-key=${env.HELIUS_API_KEY}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getSignaturesForAddress", params }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!res.ok) return { wallet, error: `rpc ${res.status}` };
+      const data = await res.json();
+      sigs = data.result || [];
+      pages++;
+      if (sigs.length) before = sigs[sigs.length - 1].signature;
+    } while (sigs.length === 1000 && pages < FUNDING_ORIGIN_MAX_PAGES);
+  } catch (e) {
+    return { wallet, error: `rpc error: ${e.message}` };
+  }
+
+  if (!sigs.length) return { wallet, error: "no transaction history found" };
+  const oldest = sigs[sigs.length - 1].signature;
+  const truncated = pages >= FUNDING_ORIGIN_MAX_PAGES && sigs.length === 1000;
+
+  try {
+    const txRes = await fetch(`${HELIUS_TX_URL}?api-key=${env.HELIUS_API_KEY}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ transactions: [oldest] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!txRes.ok) return { wallet, oldest_signature: oldest, error: `tx fetch ${txRes.status}` };
+    const [tx] = await txRes.json();
+    const nativeTransfers = tx?.nativeTransfers || [];
+    const funding = nativeTransfers.find((nt) => nt.toUserAccount === wallet && nt.fromUserAccount !== wallet);
+    return {
+      wallet,
+      oldest_signature: oldest,
+      pages_scanned: pages,
+      truncated, // true means we hit the page cap before finding the true first tx
+      funded_by: funding?.fromUserAccount || null,
+      funded_amount_sol: funding ? funding.amount / 1e9 : null,
+      native_transfers: nativeTransfers,
+    };
+  } catch (e) {
+    return { wallet, oldest_signature: oldest, error: `tx fetch error: ${e.message}` };
   }
 }
 
@@ -1085,7 +1173,8 @@ setTimeout(function(){location.reload();},60000);
 // ============================================================ HELPERS ======
 
 const short = (s) => (s && s.length > 12 ? s.slice(0, 4) + "…" + s.slice(-4) : s || "");
-const json = (o) => new Response(JSON.stringify(o, null, 2), { headers: { "content-type": "application/json" } });
+const json = (o, status = 200) =>
+  new Response(JSON.stringify(o, null, 2), { status, headers: { "content-type": "application/json" } });
 const escapeHtml = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
 /** "$BONK" if we have a Jupiter symbol for this row's mint, else a shortened mint address. */
