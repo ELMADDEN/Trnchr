@@ -76,6 +76,12 @@ const MAX_WATCHLIST_SIZE = 50;       // defensive cap regardless of config, inde
 const ANALYST_CRON = "0 */6 * * *";
 const TRENDING_SYNC_CRON = "0 */2 * * *";
 
+// Solana addresses are base58-encoded ed25519 pubkeys: 32-44 chars, and the
+// base58 alphabet excludes 0/O/I/l (ambiguous glyphs) — so this also rejects
+// things like Ethereum's 0x-prefixed hex addresses, which a length-only
+// check would let through.
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
 const parseWindow = (url) => (WINDOWS[url.searchParams.get("window")] ? url.searchParams.get("window") : "24h");
@@ -1365,7 +1371,7 @@ async function walletPage(env, rawAddress) {
       ${SEARCH_FORM}`
     );
   }
-  if (address.length < 32 || address.length > 48) {
+  if (!SOLANA_ADDRESS_RE.test(address)) {
     return htmlPage(
       "Trnchr — wallet analyzer",
       `${header}</div>
