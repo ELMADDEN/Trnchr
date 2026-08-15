@@ -118,7 +118,7 @@ export default {
       return walletPage(env, url.searchParams.get("address"));
     }
     if (url.pathname === "/") {
-      return dashboard(env, parseWindow(url));
+      return dashboard(env, parseWindow(url), url.searchParams.get("partial") === "1");
     }
     return new Response("Not found", { status: 404 });
   },
@@ -900,7 +900,7 @@ async function getFlows(env, windowSeconds = WINDOWS["24h"]) {
 
   const recent = await env.DB.prepare(
     WHALE_CTE +
-      `SELECT t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount, wa.wallet_count
+      `SELECT t.signature, t.ts, t.wallet, t.mint, tm.symbol AS symbol, t.side, t.sol_amount, t.usd_amount, wa.wallet_count
        FROM trades t
        JOIN actor_map am ON am.wallet = t.wallet
        JOIN whale_actors wa ON wa.actor = am.actor AND wa.mint = t.mint
@@ -1042,91 +1042,105 @@ async function runAnalyst(env) {
 
 // ============================================================ DASHBOARD ====
 
-/** Shared page chrome for both the flow dashboard and the wallet analyzer. */
+/**
+ * Shared page chrome for both the flow dashboard and the wallet analyzer.
+ * Dark trading-terminal theme: near-black surfaces with depth, monospace
+ * tabular numbers wherever a figure appears, a teal/coral glow on the two
+ * focal numbers (hero net, live dot), and a couple of small keyframe
+ * animations (pulsing live dot, flash-in on a freshly-arrived trade row)
+ * used by the in-place polling script below.
+ */
 const PAGE_CSS = `
-  :root{--teal:#12b886;--coral:#ff5a4d;--ink:#0b0b0d;--mut:#8a8a90;--mut2:#b0b0b6;
-        --line:#eeeeef;--card:#fff;--page:#e8e8ea;}
+  :root{--teal:#1cd9a0;--coral:#ff6b5c;--violet:#8b7cf6;--amber:#e8b34c;
+        --ink:#f1f2f5;--mut:#8d909b;--mut2:#6b6e78;
+        --line:rgba(255,255,255,.08);--bg:#08090b;--surface:#121317;--surface2:#17181d;
+        --mono:ui-monospace,"SF Mono","Cascadia Code","Roboto Mono",Menlo,Consolas,monospace;}
   *{box-sizing:border-box;margin:0}
-  body{background:var(--page);
+  body{background:var(--bg);
        font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
        color:var(--ink);padding:16px;max-width:760px;margin:0 auto}
   a{color:inherit}
-  .hero{background:var(--ink);border-radius:18px;padding:22px 22px 6px;margin-bottom:12px;overflow:hidden}
+  .hero{background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--line);
+        border-radius:18px;padding:22px 22px 6px;margin-bottom:12px;overflow:hidden}
   .htop{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
   .brand{font-size:18px;font-weight:600;letter-spacing:-0.01em;color:#fff}
-  .htag{font-size:11px;color:#6b6b70;margin-left:9px}
-  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal)}
-  .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block}
-  .navlink{font-size:11px;color:#8a8a90;text-decoration:none}
+  .htag{font-size:11px;color:var(--mut2);margin-left:9px}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal);font-family:var(--mono)}
+  .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block;
+          box-shadow:0 0 6px 1px var(--teal);animation:livepulse 1.8s ease-in-out infinite}
+  @keyframes livepulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.72)}}
+  .navlink{font-size:11px;color:var(--mut);text-decoration:none}
   .tf{display:flex;gap:4px;margin-bottom:10px}
-  .tf a{font-size:11px;font-weight:600;color:#8a8a90;padding:4px 10px;border-radius:7px;text-decoration:none;background:rgba(255,255,255,.04)}
-  .tf a.tfa{background:#fff;color:var(--ink)}
-  .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
-  .hlab a{color:#8a8a90;text-decoration:none}
-  .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
-  .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
-  .herousd{font-size:13px;color:#6b6b70;margin-top:2px}
+  .tf a{font-size:11px;font-weight:600;color:var(--mut);padding:4px 10px;border-radius:7px;text-decoration:none;background:rgba(255,255,255,.04)}
+  .tf a.tfa{background:var(--teal);color:#04140f}
+  .hlab{font-size:12px;color:var(--mut);margin-bottom:2px}
+  .hlab a{color:var(--mut);text-decoration:none}
+  .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1;font-family:var(--mono)}
+  .hsub{font-size:15px;color:var(--mut);margin-left:10px;font-weight:400}
+  .herousd{font-size:13px;color:var(--mut);margin-top:2px;font-family:var(--mono)}
   .pulsewrap{position:relative;height:80px;margin:6px -6px -2px}
-  .wsearch{display:flex;gap:8px;background:var(--card);border-radius:14px;padding:10px 12px;margin-bottom:12px}
+  .wsearch{display:flex;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px 12px;margin-bottom:12px}
   .wsearch input{flex:1;min-width:0;border:none;outline:none;font:13px -apple-system,sans-serif;background:transparent;color:var(--ink)}
   .wsearch input::placeholder{color:var(--mut)}
-  .wsearch button{border:none;background:var(--ink);color:#fff;font-size:12px;font-weight:600;padding:8px 14px;border-radius:9px;cursor:pointer;flex:none}
+  .wsearch button{border:none;background:var(--teal);color:#04140f;font-size:12px;font-weight:600;padding:8px 14px;border-radius:9px;cursor:pointer;flex:none}
   .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
-  .card{background:var(--card);border-radius:14px;padding:14px 16px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
   .clab{font-size:11px;color:var(--mut);margin-bottom:8px}
-  .cnum{font-size:26px;font-weight:600;letter-spacing:-0.02em}
+  .cnum{font-size:26px;font-weight:600;letter-spacing:-0.02em;font-family:var(--mono)}
   .csub{font-size:11px;color:var(--mut);margin-top:2px}
-  .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .panel{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
-  .frow{padding:10px 0;border-top:0.5px solid var(--line)}
+  .frow{padding:10px 0;border-top:1px solid var(--line);transition:background-color .6s ease}
   .frow-head{display:flex;align-items:center;gap:7px;margin-bottom:6px}
-  .rank{font-size:11px;font-weight:700;color:var(--mut);flex:none;width:20px}
+  .rank{font-size:11px;font-weight:700;color:var(--mut);flex:none;width:20px;font-family:var(--mono)}
   .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;flex:none}
-  .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums}
-  .chg.pos{background:rgba(18,184,134,.12);color:var(--teal)}
-  .chg.neg{background:rgba(255,90,77,.12);color:var(--coral)}
-  .warn{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(230,161,20,.14);color:#b8860b}
-  .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+  .chg.pos{background:rgba(28,217,160,.14);color:var(--teal)}
+  .chg.neg{background:rgba(255,107,92,.14);color:var(--coral)}
+  .warn{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(232,179,76,.14);color:var(--amber)}
+  .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums;font-family:var(--mono)}
   .frow-body{display:flex;align-items:center;gap:12px}
   .axis{flex:1;display:flex;align-items:center;height:14px}
   .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
-  .cen{width:1px;height:16px;background:#e0e0e4}
+  .cen{width:1px;height:16px;background:var(--line)}
   .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
   .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
   .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25;flex:none;width:84px}
-  .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
-  .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums}
+  .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+  .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums;font-family:var(--mono)}
   .pos{color:var(--teal)}.neg{color:var(--coral)}
   .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
-  .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
-  .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
+  .dom b{display:block;height:100%;background:var(--violet);border-radius:2px}
+  .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut);font-family:var(--mono)}
   .spark-row{display:flex;align-items:center;gap:8px;margin-top:8px}
   .spark-lbl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;flex:none}
   .spark{flex:none;display:block}
-  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(106,90,205,.14);color:#6a5acd}
-  .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(139,124,246,.16);color:var(--violet);font-family:var(--mono)}
+  .disp{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px;margin-bottom:12px}
   .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
-  .trow-wrap{padding-top:8px;border-top:0.5px solid var(--line)}
+  .trow-wrap{padding-top:8px;border-top:1px solid var(--line);transition:background-color 1.2s ease}
+  .trow-wrap.fresh{background:rgba(28,217,160,.10)}
   .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;font-size:12px}
-  .tm{color:var(--mut);font-variant-numeric:tabular-nums}
-  .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
-  .tusd{font-weight:400;color:var(--mut);font-size:10px}
+  .tm{color:var(--mut);font-variant-numeric:tabular-nums;font-family:var(--mono)}
+  .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums;font-family:var(--mono)}
+  .tusd{font-weight:400;color:var(--mut);font-size:10px;font-family:var(--mono)}
   .tsym{color:var(--mut);padding-left:8px}
   .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
-  .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
+  .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:var(--amber);margin-left:5px}
   .tbar{height:2px;border-radius:2px;background:var(--line);margin:6px 0 8px;overflow:hidden}
   .tbar b{display:block;height:100%;border-radius:2px}
   .tbar b.pos{background:var(--teal)}
   .tbar b.neg{background:var(--coral)}
   .empty{color:var(--mut);padding:10px 0;font-size:13px}
-  .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line);font-size:12px}
   .csym{font-weight:600;flex:none}
   .cfunder{color:var(--mut);flex:1}
-  .ctot{font-weight:600;font-variant-numeric:tabular-nums;flex:none}
-  .chain{font-size:13px;line-height:2;word-break:break-all}
+  .ctot{font-weight:600;font-variant-numeric:tabular-nums;flex:none;font-family:var(--mono)}
+  .chain{font-size:13px;line-height:2;word-break:break-all;font-family:var(--mono)}
   .chain a{color:var(--ink);text-decoration:none;font-weight:500;padding:2px 6px;background:var(--line);border-radius:6px}
   .siblist{display:flex;flex-direction:column;gap:6px}
-  .siblist a{font-size:12px;color:var(--ink);text-decoration:none;padding:6px 8px;background:var(--line);border-radius:8px;word-break:break-all}
+  .siblist a{font-size:12px;color:var(--ink);text-decoration:none;padding:6px 8px;background:var(--line);border-radius:8px;word-break:break-all;font-family:var(--mono)}
+  .updated{font-size:10px;color:var(--mut2);font-family:var(--mono)}
 `;
 
 const SEARCH_FORM = `<form class="wsearch" action="/wallet" method="get">
@@ -1140,7 +1154,7 @@ const htmlPage = (title, body) =>
     { headers: { "content-type": "text/html;charset=utf-8" } }
   );
 
-async function dashboard(env, window) {
+async function dashboard(env, window, partial) {
   let data;
   try {
     data = await getFlows(env, WINDOWS[window]);
@@ -1166,7 +1180,8 @@ async function dashboard(env, window) {
   const dexVolField = window === "1h" ? "volume_1h" : window === "6h" ? "volume_6h" : "volume_24h";
 
   const netPos = totals.net >= 0;
-  const heroColor = netPos ? "#12b886" : "#ff5a4d";
+  const heroColor = netPos ? "#1cd9a0" : "#ff6b5c";
+  const heroGlow = netPos ? "rgba(28,217,160,.35)" : "rgba(255,107,92,.35)";
 
   let buySol = 0, sellSol = 0, buyUsd = 0, sellUsd = 0;
   flows.forEach((f) => {
@@ -1256,7 +1271,7 @@ async function dashboard(env, window) {
       const t = new Date(r.ts * 1000);
       const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
       const weightPct = Math.max(4, (r.sol_amount / maxRecentSol) * 100); // floor so small trades still show a sliver
-      return `<div class="trow-wrap"${i === 0 ? ' style="border-top:none"' : ""}>
+      return `<div class="trow-wrap" data-sig="${escapeHtml(r.signature)}"${i === 0 ? ' style="border-top:none"' : ""}>
         <div class="trow">
           <span class="tm">${hm}</span>
           <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
@@ -1277,26 +1292,21 @@ async function dashboard(env, window) {
       </div>`)
     .join("");
 
-  const html = `<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trnchr — whale flow</title>
-<style>${PAGE_CSS}</style></head><body>
-
-<div class="hero">
+  const contentHtml = `<div class="hero">
   <div class="htop">
     <div><span class="brand">Trnchr</span><span class="htag">whale flow</span></div>
-    <span class="live"><b></b>Collecting</span>
+    <span class="live"><b></b>Live <span class="updated" id="updated">now</span></span>
   </div>
   <div class="tf">
     ${Object.keys(WINDOWS).map((w) => `<a href="/?window=${w}"${w === window ? ' class="tfa"' : ""}>${WINDOW_LABELS[w]}</a>`).join("")}
   </div>
   <div class="hlab">Net flow · ${WINDOW_LABELS[window]} · all tokens · ≥${minSol} SOL cumulative per whale</div>
   <div style="display:flex;align-items:baseline">
-    <span class="hero-num" style="color:${heroColor}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
+    <span class="hero-num" style="color:${heroColor};text-shadow:0 0 30px ${heroGlow}">${netPos ? "+" : ""}${Math.round(totals.net)}</span>
     <span class="hsub">SOL ${netPos ? "accumulated" : "distributed"}</span>
   </div>
   ${totals.netUsd ? `<div class="herousd">≈ ${netPos ? "+" : "-"}$${fmtUsd(Math.abs(totals.netUsd))} USD</div>` : ""}
-  <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="${WINDOW_LABELS[window]} cumulative net whale flow"></canvas></div>
+  <div class="pulsewrap"><canvas id="pulse" data-series='${JSON.stringify(series)}' data-color="${heroColor}" style="width:100%;height:80px" role="img" aria-label="${WINDOW_LABELS[window]} cumulative net whale flow"></canvas></div>
 </div>
 
 ${SEARCH_FORM}
@@ -1308,12 +1318,12 @@ ${SEARCH_FORM}
 </div>
 
 <div class="panel">
-  <div class="phead"><span>By token</span><span style="color:#c4c4ca">sell ◂ ▸ buy</span></div>
+  <div class="phead"><span>By token</span><span style="color:var(--mut2)">sell ◂ ▸ buy</span></div>
   ${flows.length ? flowRows : `<div class="empty">No whale trades yet. Once Helius fires, flows appear here.</div>`}
 </div>
 
 ${clusters.length ? `<div class="panel">
-  <div class="phead"><span>Wallet clusters</span><span style="color:#c4c4ca">same funder, multiple wallets</span></div>
+  <div class="phead"><span>Wallet clusters</span><span style="color:var(--mut2)">same funder, multiple wallets</span></div>
   ${clusterRows}
 </div>` : ""}
 
@@ -1325,30 +1335,86 @@ ${clusters.length ? `<div class="panel">
 <div class="panel">
   <div class="phead"><span>Recent whale trades</span></div>
   ${recent.length ? recentRows : `<div class="empty">Nothing yet.</div>`}
-</div>
+</div>`;
+
+  // Partial fragment for the in-place polling script below — same markup as
+  // the full page, just without the <html>/<head>/<script> wrapper, so
+  // there is exactly one place that renders any of this, ever.
+  if (partial) {
+    return new Response(contentHtml, { headers: { "content-type": "text/html;charset=utf-8" } });
+  }
+
+  const html = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trnchr — whale flow</title>
+<style>${PAGE_CSS}</style></head><body>
+
+<div id="app">${contentHtml}</div>
 
 <script>
 (function(){
-  var S=${JSON.stringify(series)}, COL="${heroColor}";
-  function rgba(a){var h=COL.substring(1);var r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);return "rgba("+r+","+g+","+b+","+a+")";}
-  var cv=document.getElementById('pulse');
-  var dpr=Math.min(window.devicePixelRatio||1,2), W=cv.clientWidth||700, H=80;
-  cv.width=W*dpr; cv.height=H*dpr; var ctx=cv.getContext('2d'); ctx.scale(dpr,dpr);
-  var n=S.length, lo=Math.min(0,Math.min.apply(null,S)), hi=Math.max(0,Math.max.apply(null,S));
-  var span=(hi-lo)||1, gap=6, dot=1.6, base=(hi/span)*(H-16)+8;
-  for(var x=0;x<W;x+=gap){
-    var fi=(x/W)*(n-1), i0=Math.floor(fi), i1=Math.min(i0+1,n-1), f=fi-i0;
-    var v=S[i0]+(S[i1]-S[i0])*f;
-    var yv=((hi-v)/span)*(H-16)+8;
-    var y0=Math.min(base,yv), y1=Math.max(base,yv);
-    for(var y=y1;y>=y0;y-=gap){
-      var head=Math.abs(y-(v<0?y1:y0))<gap;
-      ctx.fillStyle=head?COL:(x>W*0.7?rgba(0.5):rgba(0.22));
-      ctx.beginPath(); ctx.arc(x,y,head?dot+0.6:dot,0,7); ctx.fill();
+  function rgba(col,a){var h=col.substring(1);var r=parseInt(h.substr(0,2),16),g=parseInt(h.substr(2,2),16),b=parseInt(h.substr(4,2),16);return "rgba("+r+","+g+","+b+","+a+")";}
+
+  function drawPulse(){
+    var cv=document.getElementById('pulse');
+    if(!cv) return;
+    var S; try{ S=JSON.parse(cv.dataset.series||'[]'); }catch(e){ S=[]; }
+    var COL=cv.dataset.color||'#1cd9a0';
+    if(!S.length) return;
+    var dpr=Math.min(window.devicePixelRatio||1,2), W=cv.clientWidth||700, H=80;
+    cv.width=W*dpr; cv.height=H*dpr; var ctx=cv.getContext('2d'); ctx.scale(dpr,dpr);
+    var n=S.length, lo=Math.min(0,Math.min.apply(null,S)), hi=Math.max(0,Math.max.apply(null,S));
+    var span=(hi-lo)||1, gap=6, dot=1.6, base=(hi/span)*(H-16)+8;
+    for(var x=0;x<W;x+=gap){
+      var fi=(x/W)*(n-1), i0=Math.floor(fi), i1=Math.min(i0+1,n-1), f=fi-i0;
+      var v=S[i0]+(S[i1]-S[i0])*f;
+      var yv=((hi-v)/span)*(H-16)+8;
+      var y0=Math.min(base,yv), y1=Math.max(base,yv);
+      for(var y=y1;y>=y0;y-=gap){
+        var head=Math.abs(y-(v<0?y1:y0))<gap;
+        ctx.fillStyle=head?COL:(x>W*0.7?rgba(COL,0.5):rgba(COL,0.22));
+        ctx.beginPath(); ctx.arc(x,y,head?dot+0.6:dot,0,7); ctx.fill();
+      }
     }
   }
+  drawPulse();
+
+  var CUR_WINDOW=${JSON.stringify(window)};
+  var lastUpdate=Date.now();
+
+  function tickUpdated(){
+    var el=document.getElementById('updated');
+    if(!el) return;
+    var s=Math.max(0,Math.round((Date.now()-lastUpdate)/1000));
+    el.textContent = s<3 ? 'now' : s+'s ago';
+  }
+  setInterval(tickUpdated,1000);
+
+  function refresh(){
+    var input=document.querySelector('.wsearch input');
+    if (document.activeElement===input) return; // don't yank focus/typed text out from under you
+    fetch('/?window='+CUR_WINDOW+'&partial=1')
+      .then(function(r){ return r.ok ? r.text() : null; })
+      .then(function(html){
+        if (!html) return;
+        var app=document.getElementById('app');
+        var oldSigs={};
+        app.querySelectorAll('.trow-wrap[data-sig]').forEach(function(el){ oldSigs[el.dataset.sig]=true; });
+        app.innerHTML=html;
+        drawPulse();
+        lastUpdate=Date.now();
+        tickUpdated();
+        app.querySelectorAll('.trow-wrap[data-sig]').forEach(function(el){
+          if (!oldSigs[el.dataset.sig]) {
+            el.classList.add('fresh');
+            setTimeout(function(){ el.classList.remove('fresh'); },1600);
+          }
+        });
+      })
+      .catch(function(){});
+  }
+  setInterval(refresh,15000);
 })();
-setTimeout(function(){location.reload();},60000);
 </script>
 </body></html>`;
 
@@ -1456,7 +1522,7 @@ async function walletPage(env, rawAddress) {
   const body = `${header}
   <div class="hlab">${short(address)} · <a href="https://gmgn.ai/sol/address/${address}" target="_blank">GMGN</a> · <a href="https://solscan.io/account/${address}" target="_blank">Solscan</a></div>
   <div style="display:flex;align-items:baseline">
-    <span class="hero-num" style="color:#fff">${balanceSol != null ? balanceSol.toFixed(2) : "—"}</span>
+    <span class="hero-num" style="color:#fff;text-shadow:0 0 30px rgba(139,124,246,.35)">${balanceSol != null ? balanceSol.toFixed(2) : "—"}</span>
     <span class="hsub">SOL balance</span>
   </div>
   ${!heliusEnabled ? `<div class="herousd">Set HELIUS_API_KEY to enable balance, funding chain, and wallet-age lookups</div>` : ""}
@@ -1471,17 +1537,17 @@ ${SEARCH_FORM}
 </div>
 
 <div class="panel">
-  <div class="phead"><span>Shared-funder wallets</span><span style="color:#c4c4ca">seen in your tracked history</span></div>
+  <div class="phead"><span>Shared-funder wallets</span><span style="color:var(--mut2)">seen in your tracked history</span></div>
   ${siblingsHtml}
 </div>
 
 <div class="panel">
-  <div class="phead"><span>Most-recent funding chain</span><span style="color:#c4c4ca">wallet → funder → funder's funder</span></div>
+  <div class="phead"><span>Most-recent funding chain</span><span style="color:var(--mut2)">wallet → funder → funder's funder</span></div>
   ${heliusEnabled ? chainHtml : `<div class="empty">Set HELIUS_API_KEY to enable this.</div>`}
 </div>
 
 <div class="panel">
-  <div class="phead"><span>Earliest funder</span><span style="color:#c4c4ca">who first funded this wallet</span></div>
+  <div class="phead"><span>Earliest funder</span><span style="color:var(--mut2)">who first funded this wallet</span></div>
   ${heliusEnabled ? originHtml : `<div class="empty">Set HELIUS_API_KEY to enable this.</div>`}
 </div>
 
@@ -1512,7 +1578,7 @@ function sparkline(values) {
     .map((v, i) => `${(i * stepX).toFixed(1)},${(h / 2 - (v / max) * (h / 2 - 2)).toFixed(1)}`)
     .join(" ");
   const lastPos = values[values.length - 1] >= 0;
-  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="spark"><polyline points="${pts}" fill="none" stroke="${lastPos ? "#12b886" : "#ff5a4d"}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" class="spark"><polyline points="${pts}" fill="none" stroke="${lastPos ? "#1cd9a0" : "#ff6b5c"}" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 }
 
 /** Compact USD figure: 1.2M, 4.5k, or a plain integer. */
