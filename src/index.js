@@ -9,7 +9,15 @@
  *   4. Every 6 hours, an "analyst" cron summarises the last 24h
  *      (uses the Claude API if ANTHROPIC_API_KEY is set, otherwise
  *       writes a plain computed summary)
- *   5. TEMPORARY: GET /debug/funding-origin?key=WEBHOOK_SECRET&wallet=...
+ *   5. Wallet analyzer: paste any address into the search box on the
+ *      dashboard (or GET /wallet?address=...) for a one-page summary —
+ *      its trade history in your D1, its most-recent-funder chain, its
+ *      earliest funder + rough age, current SOL balance, and whether it
+ *      shares a funder with any other wallet you've already tracked (the
+ *      same signal the "Wallet clusters" panel uses, just on demand for
+ *      one address instead of aggregated across all whale flow). The D1
+ *      section works with no setup; funding/balance/age need HELIUS_API_KEY.
+ *   6. TEMPORARY: GET /debug/funding-origin?key=WEBHOOK_SECRET&wallet=...
  *      looks up a wallet's earliest funder, for validating a coordinated-
  *      wallet-cluster detection layer against known cases. Delete once done.
  *
@@ -68,6 +76,12 @@ const MAX_WATCHLIST_SIZE = 50;       // defensive cap regardless of config, inde
 const ANALYST_CRON = "0 */6 * * *";
 const TRENDING_SYNC_CRON = "0 */2 * * *";
 
+// Solana addresses are base58-encoded ed25519 pubkeys: 32-44 chars, and the
+// base58 alphabet excludes 0/O/I/l (ambiguous glyphs) — so this also rejects
+// things like Ethereum's 0x-prefixed hex addresses, which a length-only
+// check would let through.
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
 const WINDOWS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800 };
 const WINDOW_LABELS = { "1h": "1H", "6h": "6H", "24h": "24H", "7d": "7D" };
 const parseWindow = (url) => (WINDOWS[url.searchParams.get("window")] ? url.searchParams.get("window") : "24h");
@@ -99,6 +113,9 @@ export default {
       if (!wallet) return json({ error: "pass ?wallet=<address>" }, 400);
       if (!env.HELIUS_API_KEY) return json({ error: "HELIUS_API_KEY not set" }, 400);
       return json(await findFundingOrigin(env, wallet));
+    }
+    if (url.pathname === "/wallet") {
+      return walletPage(env, url.searchParams.get("address"));
     }
     if (url.pathname === "/") {
       return dashboard(env, parseWindow(url));
@@ -373,14 +390,18 @@ async function filterOutHubs(env, addresses) {
 }
 
 /**
- * DEBUG / VALIDATION ONLY — not wired into the detection pipeline.
- *
  * Finds a wallet's EARLIEST incoming external SOL transfer — who originally
  * funded it — as opposed to resolveFundingSource() above, which tracks the
  * MOST RECENT funder for merging split-wallet whale volume into one actor.
  * "Earliest funder" is the signal for a different question: who set this
  * wallet up in the first place, which is what coordinated-insider-wallet
- * detection actually needs.
+ * detection actually needs. Also returns oldest_block_time, a cheap proxy
+ * for wallet age (no extra call — it's already on the signature we fetch).
+ *
+ * Used by both the /debug/funding-origin route (manual validation against
+ * known cases) and analyzeWallet() (the /wallet analyzer page). Not cached —
+ * every call re-walks signature history, so it's meant for on-demand,
+ * one-off lookups, not bulk/background use.
  *
  * Neither Solana's RPC nor Helius's API has a "first transaction" call —
  * signature history only comes back newest-first. So this pages backwards
@@ -413,6 +434,7 @@ async function findFundingOrigin(env, wallet) {
 
   if (!sigs.length) return { wallet, error: "no transaction history found" };
   const oldest = sigs[sigs.length - 1].signature;
+  const oldestBlockTime = sigs[sigs.length - 1].blockTime ?? null;
   const truncated = pages >= FUNDING_ORIGIN_MAX_PAGES && sigs.length === 1000;
 
   try {
@@ -429,6 +451,7 @@ async function findFundingOrigin(env, wallet) {
     return {
       wallet,
       oldest_signature: oldest,
+      oldest_block_time: oldestBlockTime, // unix seconds — proxy for wallet age when not truncated
       pages_scanned: pages,
       truncated, // true means we hit the page cap before finding the true first tx
       funded_by: funding?.fromUserAccount || null,
@@ -438,6 +461,92 @@ async function findFundingOrigin(env, wallet) {
   } catch (e) {
     return { wallet, oldest_signature: oldest, error: `tx fetch error: ${e.message}` };
   }
+}
+
+/**
+ * Full on-demand summary for a single wallet address, powering the /wallet
+ * analyzer page. Combines:
+ *  - this wallet's trade history in OUR OWN D1 (always available, free)
+ *  - a same-DB cluster check: other wallets we've tracked that share this
+ *    wallet's most-recent cached funder (free — D1 only)
+ *  - the most-recent-funder chain, via resolveFundingSource (reuses its
+ *    cache) — needs HELIUS_API_KEY
+ *  - the earliest funder + a rough wallet-age signal, via findFundingOrigin
+ *    — needs HELIUS_API_KEY
+ *  - current SOL balance — needs HELIUS_API_KEY
+ * The D1-only section always returns something useful even with no Helius
+ * key configured; the on-chain sections are simply omitted in that case
+ * rather than erroring.
+ */
+async function analyzeWallet(env, address) {
+  const result = { address, heliusEnabled: !!env.HELIUS_API_KEY };
+
+  try {
+    const trades = await env.DB.prepare(
+      `SELECT t.mint, tm.symbol, t.side, t.sol_amount, t.usd_amount, t.ts
+       FROM trades t LEFT JOIN token_meta tm ON tm.mint = t.mint
+       WHERE t.wallet = ? ORDER BY t.ts DESC LIMIT 50`
+    ).bind(address).all();
+    const rows = trades.results || [];
+    result.trades = {
+      rows,
+      distinctTokens: new Set(rows.map((r) => r.mint)).size,
+      buySol: rows.filter((r) => r.side === "BUY").reduce((a, r) => a + r.sol_amount, 0),
+      sellSol: rows.filter((r) => r.side === "SELL").reduce((a, r) => a + r.sol_amount, 0),
+    };
+  } catch (e) {
+    result.trades = { rows: [], distinctTokens: 0, buySol: 0, sellSol: 0 };
+  }
+
+  try {
+    if (await tableExists(env, "wallet_funding")) {
+      const own = await env.DB.prepare(`SELECT funded_by FROM wallet_funding WHERE wallet = ?`).bind(address).first();
+      if (own?.funded_by) {
+        const siblings = await env.DB.prepare(
+          `SELECT wallet FROM wallet_funding WHERE funded_by = ? AND wallet != ?`
+        ).bind(own.funded_by, address).all();
+        result.cluster = { funder: own.funded_by, siblings: (siblings.results || []).map((r) => r.wallet) };
+      } else {
+        result.cluster = { funder: null, siblings: [] };
+      }
+    }
+  } catch (e) {
+    console.log("wallet cluster check error", e.message);
+  }
+
+  if (!env.HELIUS_API_KEY) return result;
+
+  // most-recent-funder chain: trigger the normal lookup (cache-aware, walks
+  // FUNDING_MAX_HOPS same as everywhere else) then read the resulting chain back
+  await resolveFundingSource(env, [address]);
+  const chain = [];
+  let node = address;
+  for (let i = 0; i < 5 && node; i++) {
+    const row = await env.DB.prepare(`SELECT funded_by FROM wallet_funding WHERE wallet = ?`).bind(node).first();
+    if (!row?.funded_by || chain.includes(row.funded_by) || row.funded_by === address) break;
+    chain.push(row.funded_by);
+    node = row.funded_by;
+  }
+  result.fundingChain = chain;
+
+  result.origin = await findFundingOrigin(env, address);
+
+  try {
+    const res = await fetch(`${HELIUS_RPC_URL}/?api-key=${env.HELIUS_API_KEY}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getBalance", params: [address] }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      result.balanceSol = data?.result?.value != null ? data.result.value / 1e9 : null;
+    }
+  } catch (e) {
+    console.log("balance lookup error", e.message);
+  }
+
+  return result;
 }
 
 /**
@@ -933,6 +1042,104 @@ async function runAnalyst(env) {
 
 // ============================================================ DASHBOARD ====
 
+/** Shared page chrome for both the flow dashboard and the wallet analyzer. */
+const PAGE_CSS = `
+  :root{--teal:#12b886;--coral:#ff5a4d;--ink:#0b0b0d;--mut:#8a8a90;--mut2:#b0b0b6;
+        --line:#eeeeef;--card:#fff;--page:#e8e8ea;}
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--page);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
+       color:var(--ink);padding:16px;max-width:760px;margin:0 auto}
+  a{color:inherit}
+  .hero{background:var(--ink);border-radius:18px;padding:22px 22px 6px;margin-bottom:12px;overflow:hidden}
+  .htop{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .brand{font-size:18px;font-weight:600;letter-spacing:-0.01em;color:#fff}
+  .htag{font-size:11px;color:#6b6b70;margin-left:9px}
+  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal)}
+  .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block}
+  .navlink{font-size:11px;color:#8a8a90;text-decoration:none}
+  .tf{display:flex;gap:4px;margin-bottom:10px}
+  .tf a{font-size:11px;font-weight:600;color:#8a8a90;padding:4px 10px;border-radius:7px;text-decoration:none;background:rgba(255,255,255,.04)}
+  .tf a.tfa{background:#fff;color:var(--ink)}
+  .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
+  .hlab a{color:#8a8a90;text-decoration:none}
+  .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
+  .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
+  .herousd{font-size:13px;color:#6b6b70;margin-top:2px}
+  .pulsewrap{position:relative;height:80px;margin:6px -6px -2px}
+  .wsearch{display:flex;gap:8px;background:var(--card);border-radius:14px;padding:10px 12px;margin-bottom:12px}
+  .wsearch input{flex:1;min-width:0;border:none;outline:none;font:13px -apple-system,sans-serif;background:transparent;color:var(--ink)}
+  .wsearch input::placeholder{color:var(--mut)}
+  .wsearch button{border:none;background:var(--ink);color:#fff;font-size:12px;font-weight:600;padding:8px 14px;border-radius:9px;cursor:pointer;flex:none}
+  .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
+  .card{background:var(--card);border-radius:14px;padding:14px 16px}
+  .clab{font-size:11px;color:var(--mut);margin-bottom:8px}
+  .cnum{font-size:26px;font-weight:600;letter-spacing:-0.02em}
+  .csub{font-size:11px;color:var(--mut);margin-top:2px}
+  .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
+  .frow{padding:10px 0;border-top:0.5px solid var(--line)}
+  .frow-head{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+  .rank{font-size:11px;font-weight:700;color:var(--mut);flex:none;width:20px}
+  .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;flex:none}
+  .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums}
+  .chg.pos{background:rgba(18,184,134,.12);color:var(--teal)}
+  .chg.neg{background:rgba(255,90,77,.12);color:var(--coral)}
+  .warn{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(230,161,20,.14);color:#b8860b}
+  .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .frow-body{display:flex;align-items:center;gap:12px}
+  .axis{flex:1;display:flex;align-items:center;height:14px}
+  .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
+  .cen{width:1px;height:16px;background:#e0e0e4}
+  .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
+  .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
+  .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25;flex:none;width:84px}
+  .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+  .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums}
+  .pos{color:var(--teal)}.neg{color:var(--coral)}
+  .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
+  .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
+  .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
+  .spark-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .spark-lbl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;flex:none}
+  .spark{flex:none;display:block}
+  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(106,90,205,.14);color:#6a5acd}
+  .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
+  .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
+  .trow-wrap{padding-top:8px;border-top:0.5px solid var(--line)}
+  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;font-size:12px}
+  .tm{color:var(--mut);font-variant-numeric:tabular-nums}
+  .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
+  .tusd{font-weight:400;color:var(--mut);font-size:10px}
+  .tsym{color:var(--mut);padding-left:8px}
+  .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
+  .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
+  .tbar{height:2px;border-radius:2px;background:var(--line);margin:6px 0 8px;overflow:hidden}
+  .tbar b{display:block;height:100%;border-radius:2px}
+  .tbar b.pos{background:var(--teal)}
+  .tbar b.neg{background:var(--coral)}
+  .empty{color:var(--mut);padding:10px 0;font-size:13px}
+  .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
+  .csym{font-weight:600;flex:none}
+  .cfunder{color:var(--mut);flex:1}
+  .ctot{font-weight:600;font-variant-numeric:tabular-nums;flex:none}
+  .chain{font-size:13px;line-height:2;word-break:break-all}
+  .chain a{color:var(--ink);text-decoration:none;font-weight:500;padding:2px 6px;background:var(--line);border-radius:6px}
+  .siblist{display:flex;flex-direction:column;gap:6px}
+  .siblist a{font-size:12px;color:var(--ink);text-decoration:none;padding:6px 8px;background:var(--line);border-radius:8px;word-break:break-all}
+`;
+
+const SEARCH_FORM = `<form class="wsearch" action="/wallet" method="get">
+  <input type="text" name="address" placeholder="Paste a wallet address to analyze…" autocomplete="off" spellcheck="false" required>
+  <button type="submit">Analyze →</button>
+</form>`;
+
+const htmlPage = (title, body) =>
+  new Response(
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>${PAGE_CSS}</style></head><body>${body}</body></html>`,
+    { headers: { "content-type": "text/html;charset=utf-8" } }
+  );
+
 async function dashboard(env, window) {
   let data;
   try {
@@ -1073,80 +1280,7 @@ async function dashboard(env, window) {
   const html = `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Trnchr — whale flow</title>
-<style>
-  :root{--teal:#12b886;--coral:#ff5a4d;--ink:#0b0b0d;--mut:#8a8a90;--mut2:#b0b0b6;
-        --line:#eeeeef;--card:#fff;--page:#e8e8ea;}
-  *{box-sizing:border-box;margin:0}
-  body{background:var(--page);
-       font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",sans-serif;
-       color:var(--ink);padding:16px;max-width:760px;margin:0 auto}
-  .hero{background:var(--ink);border-radius:18px;padding:22px 22px 6px;margin-bottom:12px;overflow:hidden}
-  .htop{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
-  .brand{font-size:18px;font-weight:600;letter-spacing:-0.01em;color:#fff}
-  .htag{font-size:11px;color:#6b6b70;margin-left:9px}
-  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--teal)}
-  .live b{width:6px;height:6px;border-radius:50%;background:var(--teal);display:inline-block}
-  .tf{display:flex;gap:4px;margin-bottom:10px}
-  .tf a{font-size:11px;font-weight:600;color:#8a8a90;padding:4px 10px;border-radius:7px;text-decoration:none;background:rgba(255,255,255,.04)}
-  .tf a.tfa{background:#fff;color:var(--ink)}
-  .hlab{font-size:12px;color:#6b6b70;margin-bottom:2px}
-  .hero-num{font-size:56px;font-weight:600;letter-spacing:-0.03em;line-height:1}
-  .hsub{font-size:15px;color:#6b6b70;margin-left:10px;font-weight:400}
-  .herousd{font-size:13px;color:#6b6b70;margin-top:2px}
-  .pulsewrap{position:relative;height:80px;margin:6px -6px -2px}
-  .cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px}
-  .card{background:var(--card);border-radius:14px;padding:14px 16px}
-  .clab{font-size:11px;color:var(--mut);margin-bottom:8px}
-  .cnum{font-size:26px;font-weight:600;letter-spacing:-0.02em}
-  .csub{font-size:11px;color:var(--mut);margin-top:2px}
-  .panel{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
-  .phead{font-size:12px;color:var(--mut);margin-bottom:12px;display:flex;justify-content:space-between}
-  .frow{padding:10px 0;border-top:0.5px solid var(--line)}
-  .frow-head{display:flex;align-items:center;gap:7px;margin-bottom:6px}
-  .rank{font-size:11px;font-weight:700;color:var(--mut);flex:none;width:20px}
-  .sym{font-size:13px;font-weight:500;color:var(--ink);text-decoration:none;flex:none}
-  .chg{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;font-variant-numeric:tabular-nums}
-  .chg.pos{background:rgba(18,184,134,.12);color:var(--teal)}
-  .chg.neg{background:rgba(255,90,77,.12);color:var(--coral)}
-  .warn{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(230,161,20,.14);color:#b8860b}
-  .meta{margin-left:auto;font-size:10px;color:var(--mut);white-space:nowrap;font-variant-numeric:tabular-nums}
-  .frow-body{display:flex;align-items:center;gap:12px}
-  .axis{flex:1;display:flex;align-items:center;height:14px}
-  .lft{flex:1;display:flex;justify-content:flex-end}.rgt{flex:1}
-  .cen{width:1px;height:16px;background:#e0e0e4}
-  .sell{height:8px;background:var(--coral);border-radius:4px 0 0 4px}
-  .buy{display:block;height:8px;background:var(--teal);border-radius:0 4px 4px 0}
-  .netcol{display:flex;flex-direction:column;align-items:flex-end;line-height:1.25;flex:none;width:84px}
-  .net{text-align:right;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
-  .netusd{font-size:10px;color:var(--mut);font-variant-numeric:tabular-nums}
-  .pos{color:var(--teal)}.neg{color:var(--coral)}
-  .dom{position:relative;height:3px;background:var(--line);border-radius:2px;margin-top:8px}
-  .dom b{display:block;height:100%;background:#6a5acd;border-radius:2px}
-  .domlbl{position:absolute;right:0;top:5px;font-size:9px;color:var(--mut)}
-  .spark-row{display:flex;align-items:center;gap:8px;margin-top:8px}
-  .spark-lbl{font-size:9px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em;flex:none}
-  .spark{flex:none;display:block}
-  .spike{font-size:10px;font-weight:700;padding:2px 7px;border-radius:20px;flex:none;background:rgba(106,90,205,.14);color:#6a5acd}
-  .disp{background:var(--card);border-radius:14px;padding:16px 18px;margin-bottom:12px}
-  .dtxt{font-size:14px;line-height:1.55;color:var(--ink)}
-  .trow-wrap{padding-top:8px;border-top:0.5px solid var(--line)}
-  .trow{display:grid;grid-template-columns:46px 42px 86px 1fr 82px;align-items:center;gap:8px;font-size:12px}
-  .tm{color:var(--mut);font-variant-numeric:tabular-nums}
-  .side{font-weight:600}.tsol{text-align:right;font-weight:600;font-variant-numeric:tabular-nums}
-  .tusd{font-weight:400;color:var(--mut);font-size:10px}
-  .tsym{color:var(--mut);padding-left:8px}
-  .tw{text-align:right;color:var(--mut2);text-decoration:none;position:relative}
-  .dot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#b8860b;margin-left:5px}
-  .tbar{height:2px;border-radius:2px;background:var(--line);margin:6px 0 8px;overflow:hidden}
-  .tbar b{display:block;height:100%;border-radius:2px}
-  .tbar b.pos{background:var(--teal)}
-  .tbar b.neg{background:var(--coral)}
-  .empty{color:var(--mut);padding:10px 0;font-size:13px}
-  .crow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:0.5px solid var(--line);font-size:12px}
-  .csym{font-weight:600;flex:none}
-  .cfunder{color:var(--mut);flex:1}
-  .ctot{font-weight:600;font-variant-numeric:tabular-nums;flex:none}
-</style></head><body>
+<style>${PAGE_CSS}</style></head><body>
 
 <div class="hero">
   <div class="htop">
@@ -1164,6 +1298,8 @@ async function dashboard(env, window) {
   ${totals.netUsd ? `<div class="herousd">≈ ${netPos ? "+" : "-"}$${fmtUsd(Math.abs(totals.netUsd))} USD</div>` : ""}
   <div class="pulsewrap"><canvas id="pulse" style="width:100%;height:80px" role="img" aria-label="${WINDOW_LABELS[window]} cumulative net whale flow"></canvas></div>
 </div>
+
+${SEARCH_FORM}
 
 <div class="cards">
   <div class="card"><div class="clab">Whales</div><div class="cnum">${totals.actors}</div><div class="csub">${totals.whales} wallets${totals.sybilActors ? ` · ${totals.sybilActors} clustered` : ""} · ${totals.trades} trades</div></div>
@@ -1217,6 +1353,144 @@ setTimeout(function(){location.reload();},60000);
 </body></html>`;
 
   return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
+}
+
+// ============================================================ WALLET PAGE ==
+
+async function walletPage(env, rawAddress) {
+  const address = (rawAddress || "").trim();
+  const header = `<div class="hero"><div class="htop">
+      <div><span class="brand">Trnchr</span><span class="htag">wallet analyzer</span></div>
+      <a class="navlink" href="/">← dashboard</a>
+    </div>`;
+
+  if (!address) {
+    return htmlPage(
+      "Trnchr — wallet analyzer",
+      `${header}<div class="hlab">Paste any Solana wallet address to see its trade history in your data, funding chain, and whether it shares a funder with other wallets you've already tracked.</div></div>
+      ${SEARCH_FORM}`
+    );
+  }
+  if (!SOLANA_ADDRESS_RE.test(address)) {
+    return htmlPage(
+      "Trnchr — wallet analyzer",
+      `${header}</div>
+      ${SEARCH_FORM}
+      <div class="panel"><div class="empty">"${escapeHtml(short(address))}" doesn't look like a valid Solana address.</div></div>`
+    );
+  }
+
+  let data;
+  try {
+    data = await analyzeWallet(env, address);
+  } catch (e) {
+    return htmlPage(
+      "Trnchr — wallet analyzer",
+      `${header}</div>
+      ${SEARCH_FORM}
+      <div class="panel"><div class="empty">Lookup failed: ${escapeHtml(e.message)}</div></div>`
+    );
+  }
+
+  const { trades, cluster, heliusEnabled, fundingChain, origin, balanceSol } = data;
+
+  const ageLabel = (() => {
+    if (!origin || origin.error || origin.oldest_block_time == null) return origin?.truncated ? "10k+ txs" : "—";
+    const days = Math.floor((Date.now() / 1000 - origin.oldest_block_time) / 86400);
+    if (days < 1) return "<1 day";
+    if (days < 30) return `${days}d`;
+    if (days < 365) return `${Math.floor(days / 30)}mo`;
+    return `${(days / 365).toFixed(1)}y`;
+  })();
+
+  const chainHtml =
+    fundingChain && fundingChain.length
+      ? `<div class="chain"><a href="/wallet?address=${address}">${short(address)}</a>${fundingChain
+          .map((a) => ` → <a href="/wallet?address=${a}">${short(a)}</a>`)
+          .join("")}</div>`
+      : `<div class="empty">No funder found — wallet may be brand new, self-funded via a DEX/CEX, or funded by a hub address we don't cluster through.</div>`;
+
+  const originHtml = (() => {
+    if (!origin) return `<div class="empty">Unavailable.</div>`;
+    if (origin.error) return `<div class="empty">${escapeHtml(origin.error)}</div>`;
+    if (!origin.funded_by)
+      return `<div class="empty">No incoming SOL transfer found in its earliest known transaction${
+        origin.truncated ? " (scan capped at 10k prior txs — this wallet has a long history)" : ""
+      }.</div>`;
+    return `<div class="chain">
+      <a href="/wallet?address=${origin.funded_by}">${short(origin.funded_by)}</a>
+      ${origin.funded_amount_sol != null ? ` sent ${origin.funded_amount_sol.toFixed(2)} SOL` : ""}
+      ${origin.truncated ? ' <span class="warn" title="Signature scan hit the 10k-tx cap before reaching genesis — this may not be the true first transaction">approx</span>' : ""}
+    </div>`;
+  })();
+
+  const siblingsHtml =
+    cluster && cluster.siblings.length
+      ? `<div class="siblist">${cluster.siblings
+          .map((s) => `<a href="/wallet?address=${s}">${short(s)}</a>`)
+          .join("")}</div>`
+      : `<div class="empty">${
+          cluster?.funder ? "No other tracked wallets share this funder yet." : "No cached funder for this wallet yet."
+        }</div>`;
+
+  const maxWSol = Math.max(1, ...trades.rows.map((r) => r.sol_amount));
+  const tradeRowsHtml = trades.rows
+    .map((r, i) => {
+      const isBuy = r.side === "BUY";
+      const t = new Date(r.ts * 1000);
+      const hm = String(t.getUTCHours()).padStart(2, "0") + ":" + String(t.getUTCMinutes()).padStart(2, "0");
+      const weightPct = Math.max(4, (r.sol_amount / maxWSol) * 100);
+      return `<div class="trow-wrap"${i === 0 ? ' style="border-top:none"' : ""}>
+        <div class="trow">
+          <span class="tm">${hm}</span>
+          <span class="side ${isBuy ? "pos" : "neg"}">${r.side}</span>
+          <span class="tsol">${r.sol_amount.toFixed(1)} SOL${r.usd_amount != null ? `<br><span class="tusd">$${fmtUsd(r.usd_amount)}</span>` : ""}</span>
+          <span class="tsym">${escapeHtml(tokenLabel(r))}</span>
+          <a class="tw" href="https://gmgn.ai/sol/token/${r.mint}" target="_blank">view</a>
+        </div>
+        <div class="tbar"><b class="${isBuy ? "pos" : "neg"}" style="width:${weightPct}%"></b></div>
+      </div>`;
+    })
+    .join("");
+
+  const body = `${header}
+  <div class="hlab">${short(address)} · <a href="https://gmgn.ai/sol/address/${address}" target="_blank">GMGN</a> · <a href="https://solscan.io/account/${address}" target="_blank">Solscan</a></div>
+  <div style="display:flex;align-items:baseline">
+    <span class="hero-num" style="color:#fff">${balanceSol != null ? balanceSol.toFixed(2) : "—"}</span>
+    <span class="hsub">SOL balance</span>
+  </div>
+  ${!heliusEnabled ? `<div class="herousd">Set HELIUS_API_KEY to enable balance, funding chain, and wallet-age lookups</div>` : ""}
+</div>
+
+${SEARCH_FORM}
+
+<div class="cards">
+  <div class="card"><div class="clab">Wallet age</div><div class="cnum">${ageLabel}</div><div class="csub">since earliest known tx</div></div>
+  <div class="card"><div class="clab">In your DB</div><div class="cnum">${trades.rows.length}</div><div class="csub">${trades.distinctTokens} token${trades.distinctTokens === 1 ? "" : "s"} traded</div></div>
+  <div class="card"><div class="clab">Cluster siblings</div><div class="cnum">${cluster?.siblings?.length || 0}</div><div class="csub">wallets sharing its funder</div></div>
+</div>
+
+<div class="panel">
+  <div class="phead"><span>Shared-funder wallets</span><span style="color:#c4c4ca">seen in your tracked history</span></div>
+  ${siblingsHtml}
+</div>
+
+<div class="panel">
+  <div class="phead"><span>Most-recent funding chain</span><span style="color:#c4c4ca">wallet → funder → funder's funder</span></div>
+  ${heliusEnabled ? chainHtml : `<div class="empty">Set HELIUS_API_KEY to enable this.</div>`}
+</div>
+
+<div class="panel">
+  <div class="phead"><span>Earliest funder</span><span style="color:#c4c4ca">who first funded this wallet</span></div>
+  ${heliusEnabled ? originHtml : `<div class="empty">Set HELIUS_API_KEY to enable this.</div>`}
+</div>
+
+<div class="panel">
+  <div class="phead"><span>Trade history in Trnchr</span></div>
+  ${trades.rows.length ? tradeRowsHtml : `<div class="empty">Not seen in your tracked whale trades.</div>`}
+</div>`;
+
+  return htmlPage("Trnchr — wallet analyzer", body);
 }
 
 // ============================================================ HELPERS ======
